@@ -20,6 +20,7 @@ import (
 
 	log "github.com/golang/glog"
 
+	api "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
 	"github.com/altinity/clickhouse-operator/pkg/util/runtime"
 )
 
@@ -43,14 +44,6 @@ type Announcer struct {
 	meta string
 }
 
-// announcer which would be used in top-level functions, can be called as a 'default announcer'
-var announcer Announcer
-
-// init creates default announcer
-func init() {
-	announcer = New()
-}
-
 // skip specifies file name which to be skipped from address
 const skip = "announcer.go"
 
@@ -68,21 +61,11 @@ func (a Announcer) Silence() Announcer {
 	return b
 }
 
-// Silence produces silent announcer
-func Silence() Announcer {
-	return announcer.Silence()
-}
-
 // V is inspired by log.V()
 func (a Announcer) V(level log.Level) Announcer {
 	b := a
 	b.v = level
 	return b
-}
-
-// V is inspired by log.V()
-func V(level log.Level) Announcer {
-	return announcer.V(level)
 }
 
 // F adds function name
@@ -92,21 +75,11 @@ func (a Announcer) F() Announcer {
 	return b
 }
 
-// F adds function name
-func F() Announcer {
-	return announcer.F()
-}
-
 // L adds line number
 func (a Announcer) L() Announcer {
 	b := a
 	_, b.line, _ = runtime.Caller(skip)
 	return b
-}
-
-// L adds line number
-func L() Announcer {
-	return announcer.L()
 }
 
 // FL adds filename
@@ -116,21 +89,11 @@ func (a Announcer) FL() Announcer {
 	return b
 }
 
-// FL adds filename
-func FL() Announcer {
-	return announcer.FL()
-}
-
 // A adds full code address as 'file:line:function'
 func (a Announcer) A() Announcer {
 	b := a
 	b.file, b.line, b.function = runtime.Caller(skip)
 	return b
-}
-
-// A adds full code address as 'file:line:function'
-func A() Announcer {
-	return announcer.A()
 }
 
 // S adds 'start of the function' tag, which includes:
@@ -142,12 +105,6 @@ func (a Announcer) S() Announcer {
 	return b
 }
 
-// S adds 'start of the function' tag, which includes:
-// file, line, function and start prefix
-func S() Announcer {
-	return announcer.S()
-}
-
 // E adds 'end of the function' tag, which includes:
 // file, line, function and start prefix
 func (a Announcer) E() Announcer {
@@ -155,12 +112,6 @@ func (a Announcer) E() Announcer {
 	b.prefix = "end"
 	b.file, b.line, b.function = runtime.Caller(skip)
 	return b
-}
-
-// E adds 'end of the function' tag, which includes:
-// file, line, function and start prefix
-func E() Announcer {
-	return announcer.E()
 }
 
 // M adds object meta as 'namespace/name'
@@ -175,8 +126,16 @@ func (a Announcer) M(m ...interface{}) Announcer {
 		switch typed := m[0].(type) {
 		case string:
 			b.meta = typed
+		case *api.ClickHouseInstallation:
+			if typed == nil {
+				return a
+			}
+			b.meta = typed.Namespace + "/" + typed.Name
+			if typed.GetSpecT().HasTaskID() {
+				b.meta += "/" + typed.GetSpecT().GetTaskID()
+			}
 		default:
-			if meta, ok := a.findMeta(m[0]); ok {
+			if meta, ok := a.tryToFindNamespaceNameEverywhere(m[0]); ok {
 				b.meta = meta
 			} else {
 				return a
@@ -190,19 +149,9 @@ func (a Announcer) M(m ...interface{}) Announcer {
 	return b
 }
 
-// M adds object meta as 'namespace/name'
-func M(m ...interface{}) Announcer {
-	return announcer.M(m...)
-}
-
 // P triggers log to print line
 func (a Announcer) P() {
 	a.Info("")
-}
-
-// P triggers log to print line
-func P() {
-	announcer.P()
 }
 
 // Info is inspired by log.Infof()
@@ -228,11 +177,6 @@ func (a Announcer) Info(format string, args ...interface{}) {
 	}
 }
 
-// Info is inspired by log.Infof()
-func Info(format string, args ...interface{}) {
-	announcer.Info(format, args...)
-}
-
 // Warning is inspired by log.Warningf()
 func (a Announcer) Warning(format string, args ...interface{}) {
 	// Produce classic log line
@@ -246,11 +190,6 @@ func (a Announcer) Warning(format string, args ...interface{}) {
 	} else {
 		log.Warning(format)
 	}
-}
-
-// Warning is inspired by log.Warningf()
-func Warning(format string, args ...interface{}) {
-	announcer.Warning(format, args...)
 }
 
 // Error is inspired by log.Errorf()
@@ -268,11 +207,6 @@ func (a Announcer) Error(format string, args ...interface{}) {
 	}
 }
 
-// Error is inspired by log.Errorf()
-func Error(format string, args ...interface{}) {
-	announcer.Error(format, args...)
-}
-
 // Fatal is inspired by log.Fatalf()
 func (a Announcer) Fatal(format string, args ...interface{}) {
 	format = a.prependFormat(format)
@@ -282,11 +216,6 @@ func (a Announcer) Fatal(format string, args ...interface{}) {
 	} else {
 		log.Fatal(format)
 	}
-}
-
-// Fatal is inspired by log.Fatalf()
-func Fatal(format string, args ...interface{}) {
-	announcer.Fatal(format, args...)
 }
 
 // prependFormat
@@ -331,36 +260,33 @@ func (a Announcer) prependFormat(format string) string {
 	return format
 }
 
-// findMeta
-func (a Announcer) findMeta(m interface{}) (string, bool) {
-	if meta, ok := a.findInObjectMeta(m); ok {
+// tryToFindNamespaceNameEverywhere
+func (a Announcer) tryToFindNamespaceNameEverywhere(m interface{}) (string, bool) {
+	if meta, ok := a.findNamespaceName(m); ok {
 		return meta, ok
 	}
-	if meta, ok := a.findInCHI(m); ok {
-		return meta, ok
-	}
-	if meta, ok := a.findInAddress(m); ok {
+	if meta, ok := a.findCHI(m); ok {
 		return meta, ok
 	}
 	return "", false
 }
 
-// findInObjectMeta
-func (a Announcer) findInObjectMeta(m interface{}) (string, bool) {
+// findNamespaceName
+func (a Announcer) findNamespaceName(m interface{}) (string, bool) {
 	if m == nil {
 		return "", false
 	}
-	meta := reflect.ValueOf(m)
-	if !meta.IsValid() || meta.IsZero() || ((meta.Kind() == reflect.Ptr) && meta.IsNil()) {
+	value := reflect.ValueOf(m)
+	if !value.IsValid() || value.IsZero() || ((value.Kind() == reflect.Ptr) && value.IsNil()) {
 		return "", false
 	}
 	var namespace, name reflect.Value
-	if meta.Kind() == reflect.Ptr {
-		namespace = meta.Elem().FieldByName("Namespace")
-		name = meta.Elem().FieldByName("Name")
+	if value.Kind() == reflect.Ptr {
+		namespace = value.Elem().FieldByName("Namespace")
+		name = value.Elem().FieldByName("Name")
 	} else {
-		namespace = meta.FieldByName("Namespace")
-		name = meta.FieldByName("Name")
+		namespace = value.FieldByName("Namespace")
+		name = value.FieldByName("Name")
 	}
 	if !namespace.IsValid() {
 		return "", false
@@ -371,58 +297,34 @@ func (a Announcer) findInObjectMeta(m interface{}) (string, bool) {
 	return namespace.String() + "/" + name.String(), true
 }
 
-// findInCHI
-func (a Announcer) findInCHI(m interface{}) (string, bool) {
+// findCHI
+func (a Announcer) findCHI(m interface{}) (string, bool) {
 	if m == nil {
 		return "", false
 	}
-	object := reflect.ValueOf(m)
-	if !object.IsValid() || object.IsZero() || ((object.Kind() == reflect.Ptr) && object.IsNil()) {
+	value := reflect.ValueOf(m)
+	if !value.IsValid() || value.IsZero() || ((value.Kind() == reflect.Ptr) && value.IsNil()) {
 		return "", false
 	}
-	chi := object.Elem().FieldByName("CHI")
-	if !chi.IsValid() || chi.IsZero() || ((chi.Kind() == reflect.Ptr) && chi.IsNil()) {
-		return "", false
-	}
-	var namespace, name reflect.Value
-	if chi.Kind() == reflect.Ptr {
-		namespace = chi.Elem().FieldByName("Namespace")
-		name = chi.Elem().FieldByName("Name")
+	// Find CHI
+	var _chi reflect.Value
+	if value.Kind() == reflect.Ptr {
+		_chi = value.Elem().FieldByName("CHI")
 	} else {
-		namespace = chi.FieldByName("Namespace")
-		name = chi.FieldByName("Name")
+		_chi = value.FieldByName("CHI")
 	}
-	if !namespace.IsValid() {
+	if !_chi.IsValid() || _chi.IsZero() || ((_chi.Kind() == reflect.Ptr) && _chi.IsNil()) {
 		return "", false
 	}
-	if !name.IsValid() {
-		return "", false
-	}
-	return namespace.String() + "/" + name.String(), true
-}
 
-// findInAddress
-func (a Announcer) findInAddress(m interface{}) (string, bool) {
-	if m == nil {
+	// Cast to CHI
+	chi, ok := _chi.Interface().(api.ClickHouseInstallation)
+	if !ok {
 		return "", false
 	}
-	address := reflect.ValueOf(m)
-	if !address.IsValid() || address.IsZero() || ((address.Kind() == reflect.Ptr) && address.IsNil()) {
-		return "", false
+	res := chi.Namespace + "/" + chi.Name
+	if chi.GetSpecT().HasTaskID() {
+		res += "/" + chi.GetSpecT().GetTaskID()
 	}
-	var namespace, name reflect.Value
-	if address.Kind() == reflect.Ptr {
-		namespace = address.Elem().FieldByName("Namespace")
-		name = address.Elem().FieldByName("Name")
-	} else {
-		namespace = address.FieldByName("Namespace")
-		name = address.FieldByName("Name")
-	}
-	if !namespace.IsValid() {
-		return "", false
-	}
-	if !name.IsValid() {
-		return "", false
-	}
-	return namespace.String() + "/" + name.String(), true
+	return res, true
 }

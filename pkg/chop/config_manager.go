@@ -16,19 +16,21 @@ package chop
 
 import (
 	"context"
-	"io/ioutil"
+	"errors"
+	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
 	"sort"
 
 	"github.com/kubernetes-sigs/yaml"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kube "k8s.io/client-go/kubernetes"
 
 	log "github.com/altinity/clickhouse-operator/pkg/announcer"
-	chiv1 "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
-	chopclientset "github.com/altinity/clickhouse-operator/pkg/client/clientset/versioned"
+	api "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
+	"github.com/altinity/clickhouse-operator/pkg/apis/deployment"
+	chopClientSet "github.com/altinity/clickhouse-operator/pkg/client/clientset/versioned"
+	"github.com/altinity/clickhouse-operator/pkg/controller"
 )
 
 // ConfigManager specifies configuration manager in charge of operator's configuration
@@ -37,24 +39,24 @@ type ConfigManager struct {
 	kubeClient *kube.Clientset
 
 	// chopClient is a k8s client able to communicate with operator's Custom Resources
-	chopClient *chopclientset.Clientset
+	chopClient *chopClientSet.Clientset
 
 	// chopConfigList is a list of available operator configurations
-	chopConfigList *chiv1.ClickHouseOperatorConfigurationList
+	chopConfigList *api.ClickHouseOperatorConfigurationList
 
 	// initConfigFilePath is a path to the configuration file, which will be used as initial/seed
 	// to build final config, which will be used/consumed by users
 	initConfigFilePath string
 
 	// fileConfig is a prepared file-based config
-	fileConfig *chiv1.OperatorConfig
+	fileConfig *api.OperatorConfig
 
 	// crConfigs is a slice of prepared Custom Resource based configs
-	crConfigs []*chiv1.OperatorConfig
+	crConfigs []*api.OperatorConfig
 
 	// config is the final config, built as merge of all available configs.
 	// This config is ready to use/be consumed by users
-	config *chiv1.OperatorConfig
+	config *api.OperatorConfig
 
 	// runtimeParams is set/map of runtime params, influencing configuration
 	runtimeParams map[string]string
@@ -63,7 +65,7 @@ type ConfigManager struct {
 // NewConfigManager creates new ConfigManager
 func NewConfigManager(
 	kubeClient *kube.Clientset,
-	chopClient *chopclientset.Clientset,
+	chopClient *chopClientSet.Clientset,
 	initConfigFilePath string,
 ) *ConfigManager {
 	return &ConfigManager{
@@ -81,18 +83,19 @@ func (cm *ConfigManager) Init() error {
 	cm.runtimeParams = cm.getEnvVarParams()
 	cm.logEnvVarParams()
 
-	// Get initial config from file
+	// Get initial config from the file
 	cm.fileConfig, err = cm.getFileBasedConfig(cm.initConfigFilePath)
 	if err != nil {
 		return err
 	}
-	log.V(1).Info("File-based ClickHouseOperatorConfigurations")
-	log.V(1).Info(cm.fileConfig.String(true))
+	log.V(1).Info("File-based CHOP config:")
+	log.V(1).Info("\n" + cm.fileConfig.String(true))
 
-	// Get configs from all config Custom Resources
-	watchedNamespace := cm.fileConfig.GetInformerNamespace()
-	cm.getCRBasedConfigs(watchedNamespace)
-	cm.logCRBasedConfigs()
+	// Get configs from all config Custom Resources that are located in the namespace where Operator is running
+	if namespace, ok := cm.GetRuntimeParam(deployment.OPERATOR_POD_NAMESPACE); ok {
+		cm.getAllCRBasedConfigs(namespace)
+		cm.logAllCRBasedConfigs()
+	}
 
 	// Prepare one unified config from all available config pieces
 	cm.buildUnifiedConfig()
@@ -100,35 +103,37 @@ func (cm *ConfigManager) Init() error {
 	cm.fetchSecretCredentials()
 
 	// From now on we have one unified CHOP config
-	log.V(1).Info("Unified (but not post-processed yet) CHOP config")
-	log.V(1).Info(cm.config.String(true))
+	log.V(1).Info("Unified CHOP config - with secret data fetched (but not post-processed yet):")
+	log.V(1).Info("\n" + cm.config.String(true))
 
 	// Finalize config by post-processing
 	cm.Postprocess()
 
 	// OperatorConfig is ready
-	log.V(1).Info("Final CHOP config")
-	log.V(1).Info(cm.config.String(true))
+	log.V(1).Info("Final CHOP config:")
+	log.V(1).Info("\n" + cm.config.String(true))
 
 	return nil
 }
 
 // Config is an access wrapper
-func (cm *ConfigManager) Config() *chiv1.OperatorConfig {
+func (cm *ConfigManager) Config() *api.OperatorConfig {
 	return cm.config
 }
 
-// getCRBasedConfigs reads all ClickHouseOperatorConfiguration objects in specified namespace
-func (cm *ConfigManager) getCRBasedConfigs(namespace string) {
+// getAllCRBasedConfigs reads all ClickHouseOperatorConfiguration objects in specified namespace
+func (cm *ConfigManager) getAllCRBasedConfigs(namespace string) {
 	// We need to have chop kube client available in order to fetch ClickHouseOperatorConfiguration objects
 	if cm.chopClient == nil {
 		return
 	}
 
+	log.V(1).F().Info("Looking for ClickHouseOperatorConfigurations in namespace '%s'.", namespace)
+
 	// Get list of ClickHouseOperatorConfiguration objects
 	var err error
-	if cm.chopConfigList, err = cm.chopClient.ClickhouseV1().ClickHouseOperatorConfigurations(namespace).List(context.TODO(), metav1.ListOptions{}); err != nil {
-		log.V(1).A().Error("Error read ClickHouseOperatorConfigurations %v", err)
+	if cm.chopConfigList, err = cm.chopClient.ClickhouseV1().ClickHouseOperatorConfigurations(namespace).List(context.TODO(), controller.NewListOptions()); err != nil {
+		log.V(1).F().Error("Error read ClickHouseOperatorConfigurations in namespace '%s'. Err: %v", namespace, err)
 		return
 	}
 
@@ -136,7 +141,7 @@ func (cm *ConfigManager) getCRBasedConfigs(namespace string) {
 		return
 	}
 
-	// Get sorted names of ClickHouseOperatorConfiguration objects from the list of objects
+	// Get sorted list of names of ClickHouseOperatorConfiguration objects located in specified namespace
 	var names []string
 	for i := range cm.chopConfigList.Items {
 		chOperatorConfiguration := &cm.chopConfigList.Items[i]
@@ -144,28 +149,30 @@ func (cm *ConfigManager) getCRBasedConfigs(namespace string) {
 	}
 	sort.Strings(names)
 
-	// Build sorted slice of configs
+	// Build sorted list of configs
 	for _, name := range names {
 		for i := range cm.chopConfigList.Items {
 			// Convenience wrapper
 			chOperatorConfiguration := &cm.chopConfigList.Items[i]
 			if chOperatorConfiguration.Name == name {
 				// Save location info into OperatorConfig itself
-				chOperatorConfiguration.Spec.ConfigFolderPath = namespace
-				chOperatorConfiguration.Spec.ConfigFilePath = name
+				chOperatorConfiguration.Spec.Runtime.ConfigCRNamespace = namespace
+				chOperatorConfiguration.Spec.Runtime.ConfigCRName = name
 
 				cm.crConfigs = append(cm.crConfigs, &chOperatorConfiguration.Spec)
+
+				log.V(1).F().Error("Append ClickHouseOperatorConfigurations '%s/%s'.", namespace, name)
 				continue
 			}
 		}
 	}
 }
 
-// logCRBasedConfigs writes all ClickHouseOperatorConfiguration objects into log
-func (cm *ConfigManager) logCRBasedConfigs() {
+// logAllCRBasedConfigs writes all ClickHouseOperatorConfiguration objects into log
+func (cm *ConfigManager) logAllCRBasedConfigs() {
 	for _, chOperatorConfiguration := range cm.crConfigs {
-		log.V(1).Info("chop config %s/%s :", chOperatorConfiguration.ConfigFolderPath, chOperatorConfiguration.ConfigFilePath)
-		log.V(1).Info(chOperatorConfiguration.String(true))
+		log.V(1).Info("CR-based chop config: %s/%s :", chOperatorConfiguration.Runtime.ConfigCRNamespace, chOperatorConfiguration.Runtime.ConfigCRName)
+		log.V(1).Info("\n" + chOperatorConfiguration.String(true))
 	}
 }
 
@@ -177,12 +184,16 @@ func (cm *ConfigManager) buildUnifiedConfig() {
 
 	// Merge all the rest CR-based configs into base config
 	for _, chOperatorConfiguration := range cm.crConfigs {
-		_ = cm.config.MergeFrom(chOperatorConfiguration, chiv1.MergeTypeOverrideByNonEmptyValues)
+		_ = cm.config.MergeFrom(chOperatorConfiguration, api.MergeTypeOverrideByNonEmptyValues)
+		cm.config.Runtime.ConfigCRSources = append(cm.config.Runtime.ConfigCRSources, api.ConfigCRSource{
+			Namespace: chOperatorConfiguration.Runtime.ConfigCRNamespace,
+			Name:      chOperatorConfiguration.Runtime.ConfigCRName,
+		})
 	}
 }
 
 // IsConfigListed checks whether specified ClickHouseOperatorConfiguration is listed in list of ClickHouseOperatorConfiguration(s)
-func (cm *ConfigManager) IsConfigListed(config *chiv1.ClickHouseOperatorConfiguration) bool {
+func (cm *ConfigManager) IsConfigListed(config *api.ClickHouseOperatorConfiguration) bool {
 	for i := range cm.chopConfigList.Items {
 		chOperatorConfiguration := &cm.chopConfigList.Items[i]
 
@@ -197,105 +208,146 @@ func (cm *ConfigManager) IsConfigListed(config *chiv1.ClickHouseOperatorConfigur
 	return false
 }
 
-// getFileBasedConfig creates OperatorConfig object based on file specified
-func (cm *ConfigManager) getFileBasedConfig(configFilePath string) (*chiv1.OperatorConfig, error) {
-	// In case we have config file specified - that's it
+const (
+	fileIsOptional  = true
+	fileIsMandatory = false
+)
+
+// getFileBasedConfig creates one OperatorConfig object based on the first available configuration file
+func (cm *ConfigManager) getFileBasedConfig(configFilePath string) (*api.OperatorConfig, error) {
+	// Check config files availability in the following order:
+	// 1. Explicitly specified config file as CLI option
+	// 2. Explicitly specified config file as ENV var
+	// 3. Well-known config file in home dir
+	// 4. Well-known config file in /etc
+	// In case no file found fallback to the default config
+
+	// 1. Check config file as explicitly specified CLI option
 	if len(configFilePath) > 0 {
-		// Config file explicitly specified as CLI flag
-		conf, err := cm.buildConfigFromFile(configFilePath)
+		// Config file is explicitly specified as a CLI flag, has to have this file.
+		// Absence of the file is an error.
+		conf, err := cm.buildConfigFromFile(configFilePath, fileIsMandatory)
 		if err != nil {
 			return nil, err
 		}
-		return conf, nil
-	}
-
-	// No file specified - look for ENV var config file path specification
-	if len(os.Getenv(chiv1.CHOP_CONFIG)) > 0 {
-		// Config file explicitly specified as ENV var
-		conf, err := cm.buildConfigFromFile(os.Getenv(chiv1.CHOP_CONFIG))
-		if err != nil {
-			return nil, err
-		}
-		return conf, nil
-	}
-
-	// No ENV var specified - look into user's homedir
-	// Try to find ~/.clickhouse-operator/config.yaml
-	usr, err := user.Current()
-	if err == nil {
-		// OS user found. Parse ~/.clickhouse-operator/config.yaml file
-		if conf, err := cm.buildConfigFromFile(filepath.Join(usr.HomeDir, ".clickhouse-operator", "config.yaml")); err == nil {
-			// Able to build config, all is fine
+		if conf != nil {
 			return conf, nil
 		}
+		// Since this file is a mandatory one - has to fail
+		return nil, fmt.Errorf("welcome Schrodinger: no conf, no err")
 	}
 
-	// No config file in user's homedir - look for global config in /etc/
+	// 2. Check config file as explicitly specified ENV var
+	configFilePath = os.Getenv(deployment.CHOP_CONFIG)
+	if len(configFilePath) > 0 {
+		// Config file is explicitly specified as an ENV var, has to have this file.
+		// Absence of the file is an error.
+		conf, err := cm.buildConfigFromFile(configFilePath, fileIsMandatory)
+		if err != nil {
+			return nil, err
+		}
+		if conf != nil {
+			return conf, nil
+		}
+		// Since this file is a mandatory one - has to fail
+		return nil, fmt.Errorf("welcome Schrodinger: no conf, no err")
+	}
+
+	// 3. Check config file as well-known config file in home dir
+	// Try to find ~/.clickhouse-operator/config.yaml
+	if usr, err := user.Current(); err == nil {
+		// OS user found. Parse ~/.clickhouse-operator/config.yaml file
+		// File is optional, absence of the file is not an error.
+		configFilePath = filepath.Join(usr.HomeDir, ".clickhouse-operator", "config.yaml")
+		conf, err := cm.buildConfigFromFile(configFilePath, fileIsOptional)
+		if err != nil {
+			return nil, err
+		}
+		if conf != nil {
+			return conf, nil
+		}
+		// Since this file is an optional one - no return, continue to the next option
+	}
+
+	// 3. Check config file as well-known config file in /etc
 	// Try to find /etc/clickhouse-operator/config.yaml
-	if conf, err := cm.buildConfigFromFile("/etc/clickhouse-operator/config.yaml"); err == nil {
-		// Able to build config, all is fine
-		return conf, nil
+	{
+		configFilePath = "/etc/clickhouse-operator/config.yaml"
+		// File is optional, absence of the file is not an error
+		conf, err := cm.buildConfigFromFile(configFilePath, fileIsOptional)
+		if err != nil {
+			return nil, err
+		}
+		if conf != nil {
+			return conf, nil
+		}
+		// Since this file is an optional one - no return, continue to the next option
 	}
 
-	// No config file found, use default one
+	// No any config file found, fallback to default configuration
 	return cm.buildDefaultConfig()
 }
 
 // buildConfigFromFile returns OperatorConfig struct built out of specified file path
-func (cm *ConfigManager) buildConfigFromFile(configFilePath string) (*chiv1.OperatorConfig, error) {
+func (cm *ConfigManager) buildConfigFromFile(configFilePath string, optional bool) (*api.OperatorConfig, error) {
+	if _, err := os.Stat(configFilePath); errors.Is(err, os.ErrNotExist) && optional {
+		// File does not exist, but it is optional. so there is not error per se
+		return nil, nil
+	}
+
 	// Read config file content
-	yamlText, err := ioutil.ReadFile(filepath.Clean(configFilePath))
+	yamlText, err := os.ReadFile(filepath.Clean(configFilePath))
 	if err != nil {
 		return nil, err
 	}
 
 	// Parse config file content into OperatorConfig struct
-	config := new(chiv1.OperatorConfig)
+	config := new(api.OperatorConfig)
 	err = yaml.Unmarshal(yamlText, config)
 	if err != nil {
 		return nil, err
 	}
 
 	// Fill OperatorConfig's paths
-	config.ConfigFilePath, _ = filepath.Abs(configFilePath)
-	config.ConfigFolderPath = filepath.Dir(config.ConfigFilePath)
+	config.Runtime.ConfigFilePath, _ = filepath.Abs(configFilePath)
+	config.Runtime.ConfigFolderPath = filepath.Dir(config.Runtime.ConfigFilePath)
 
 	return config, nil
 
 }
 
 // buildDefaultConfig returns default OperatorConfig
-func (cm *ConfigManager) buildDefaultConfig() (*chiv1.OperatorConfig, error) {
-	config := new(chiv1.OperatorConfig)
+func (cm *ConfigManager) buildDefaultConfig() (*api.OperatorConfig, error) {
+	config := api.OperatorConfig{}
 
-	return config, nil
+	return &config, nil
 }
 
-// getEnvVarParamNames return list of ENV VARS parameter names
-func (cm *ConfigManager) getEnvVarParamNames() []string {
+// listSupportedEnvVarNames return list of ENV vars that the operator supports
+func (cm *ConfigManager) listSupportedEnvVarNames() []string {
 	// This list of ENV VARS is specified in operator .yaml manifest, section "kind: Deployment"
 	return []string{
-		chiv1.OPERATOR_POD_NODE_NAME,
-		chiv1.OPERATOR_POD_NAME,
-		chiv1.OPERATOR_POD_NAMESPACE,
-		chiv1.OPERATOR_POD_IP,
-		chiv1.OPERATOR_POD_SERVICE_ACCOUNT,
+		deployment.OPERATOR_POD_NODE_NAME,
+		deployment.OPERATOR_POD_NAME,
+		deployment.OPERATOR_POD_NAMESPACE,
+		deployment.OPERATOR_POD_IP,
+		deployment.OPERATOR_POD_SERVICE_ACCOUNT,
 
-		chiv1.OPERATOR_CONTAINER_CPU_REQUEST,
-		chiv1.OPERATOR_CONTAINER_CPU_LIMIT,
-		chiv1.OPERATOR_CONTAINER_MEM_REQUEST,
-		chiv1.OPERATOR_CONTAINER_MEM_LIMIT,
+		deployment.OPERATOR_CONTAINER_CPU_REQUEST,
+		deployment.OPERATOR_CONTAINER_CPU_LIMIT,
+		deployment.OPERATOR_CONTAINER_MEM_REQUEST,
+		deployment.OPERATOR_CONTAINER_MEM_LIMIT,
 
-		chiv1.WATCH_NAMESPACE,
-		chiv1.WATCH_NAMESPACES,
+		deployment.WATCH_NAMESPACE,
+		deployment.WATCH_NAMESPACES,
 	}
 }
 
-// getEnvVarParams returns map[string]string of ENV VARS with some runtime parameters
+// getEnvVarParams returns base set of runtime parameters filled by ENV vars
 func (cm *ConfigManager) getEnvVarParams() map[string]string {
 	params := make(map[string]string)
 	// Extract parameters from ENV VARS
-	for _, varName := range cm.getEnvVarParamNames() {
+	for _, varName := range cm.listSupportedEnvVarNames() {
 		params[varName] = os.Getenv(varName)
 	}
 
@@ -339,43 +391,54 @@ func (cm *ConfigManager) GetRuntimeParam(name string) (string, bool) {
 
 // fetchSecretCredentials
 func (cm *ConfigManager) fetchSecretCredentials() {
-	// Secret name where to look for credentials
-	name := cm.config.CHCredentialsSecretName
+	// Secret name where to look for ClickHouse access credentials
+	name := cm.config.ClickHouse.Access.Secret.Name
 
 	// Do we need to fetch credentials from the secret?
 	if name == "" {
-		// No name specified, no need to read secret
+		// No secret name specified, no need to read it
 		return
 	}
 
 	// We have secret name specified, let's move on and read credentials
 
 	// Figure out namespace where to look for the secret
-	namespace := cm.config.CHCredentialsSecretNamespace
+	namespace := cm.config.ClickHouse.Access.Secret.Namespace
 	if namespace == "" {
 		// No namespace explicitly specified, let's look into namespace where pod is running
-		if cm.HasRuntimeParam(chiv1.OPERATOR_POD_NAMESPACE) {
-			namespace, _ = cm.GetRuntimeParam(chiv1.OPERATOR_POD_NAMESPACE)
+		if cm.HasRuntimeParam(deployment.OPERATOR_POD_NAMESPACE) {
+			namespace, _ = cm.GetRuntimeParam(deployment.OPERATOR_POD_NAMESPACE)
 		}
 	}
 
+	log.V(1).Info("Going to search for username/password in the secret '%s/%s'", namespace, name)
+
 	// Sanity check
-	if (namespace == "") || (name == "") {
+	if namespace == "" {
+		// We've already checked that name is not empty
+		cm.config.ClickHouse.Access.Secret.Runtime.Error = fmt.Sprintf("Still empty namespace for secret '%s'", name)
 		return
 	}
 
-	secret, err := cm.kubeClient.CoreV1().Secrets(namespace).Get(context.TODO(), name, metav1.GetOptions{})
+	secret, err := cm.kubeClient.CoreV1().Secrets(namespace).Get(context.TODO(), name, controller.NewGetOptions())
 	if err != nil {
+		cm.config.ClickHouse.Access.Secret.Runtime.Error = err.Error()
+		log.V(1).Warning("Unable to fetch secret: '%s/%s'", namespace, name)
 		return
 	}
+
+	cm.config.ClickHouse.Access.Secret.Runtime.Fetched = true
+	log.V(1).Info("Secret fetched: '%s/%s'", namespace, name)
 
 	// Find username and password from credentials
 	for key, value := range secret.Data {
 		switch key {
 		case "username":
-			cm.config.CHCredentialsSecretUsername = string(value)
+			cm.config.ClickHouse.Access.Secret.Runtime.Username = string(value)
+			log.V(1).Info("Username read from the secret: '%s/%s'", namespace, name)
 		case "password":
-			cm.config.CHCredentialsSecretPassword = string(value)
+			cm.config.ClickHouse.Access.Secret.Runtime.Password = string(value)
+			log.V(1).Info("Password read from the secret: '%s/%s'", namespace, name)
 		}
 	}
 }

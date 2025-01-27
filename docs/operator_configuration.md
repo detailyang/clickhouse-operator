@@ -149,7 +149,7 @@ spec:
         spec:
           containers:
             - name: clickhouse-pod
-              image: yandex/clickhouse-server:19.11.8.46
+              image: clickhouse/clickhouse-server:23.8
 ```
 
 Template needs to be deployed to some namespace, and later on used in the installation:

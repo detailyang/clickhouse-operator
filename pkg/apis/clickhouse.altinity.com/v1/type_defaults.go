@@ -14,34 +14,52 @@
 
 package v1
 
-// NewChiDefaults creates new ChiDefaults object
-func NewChiDefaults() *ChiDefaults {
-	return new(ChiDefaults)
+import "github.com/altinity/clickhouse-operator/pkg/apis/common/types"
+
+// Defaults defines defaults section of .spec
+type Defaults struct {
+	ReplicasUseFQDN   *types.StringBool  `json:"replicasUseFQDN,omitempty"    yaml:"replicasUseFQDN,omitempty"`
+	DistributedDDL    *DistributedDDL    `json:"distributedDDL,omitempty"     yaml:"distributedDDL,omitempty"`
+	StorageManagement *StorageManagement `json:"storageManagement,omitempty"  yaml:"storageManagement,omitempty"`
+	Templates         *TemplatesList     `json:"templates,omitempty"          yaml:"templates,omitempty"`
+}
+
+// NewDefaults creates new Defaults object
+func NewDefaults() *Defaults {
+	return new(Defaults)
+}
+
+func (d *Defaults) GetDistributedDDL() *DistributedDDL {
+	if d == nil {
+		return nil
+	}
+	return d.DistributedDDL
 }
 
 // MergeFrom merges from specified object
-func (defaults *ChiDefaults) MergeFrom(from *ChiDefaults, _type MergeType) *ChiDefaults {
+func (defaults *Defaults) MergeFrom(from *Defaults, _type MergeType) *Defaults {
 	if from == nil {
 		return defaults
 	}
 
 	if defaults == nil {
-		defaults = NewChiDefaults()
+		defaults = NewDefaults()
 	}
 
 	switch _type {
 	case MergeTypeFillEmptyValues:
-		if from.ReplicasUseFQDN == "" {
-			defaults.ReplicasUseFQDN = from.ReplicasUseFQDN
+		if !from.ReplicasUseFQDN.HasValue() {
+			defaults.ReplicasUseFQDN = defaults.ReplicasUseFQDN.MergeFrom(from.ReplicasUseFQDN)
 		}
 	case MergeTypeOverrideByNonEmptyValues:
-		if from.ReplicasUseFQDN != "" {
+		if from.ReplicasUseFQDN.HasValue() {
 			// Override by non-empty values only
-			defaults.ReplicasUseFQDN = from.ReplicasUseFQDN
+			defaults.ReplicasUseFQDN = defaults.ReplicasUseFQDN.MergeFrom(from.ReplicasUseFQDN)
 		}
 	}
 
 	defaults.DistributedDDL = defaults.DistributedDDL.MergeFrom(from.DistributedDDL, _type)
+	defaults.StorageManagement = defaults.StorageManagement.MergeFrom(from.StorageManagement, _type)
 	defaults.Templates = defaults.Templates.MergeFrom(from.Templates, _type)
 
 	return defaults

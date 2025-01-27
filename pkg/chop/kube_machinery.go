@@ -16,16 +16,19 @@ package chop
 
 import (
 	"fmt"
-	v1 "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
 	"os"
 	"os/user"
 	"path/filepath"
+	"strconv"
 
+	apiextensions "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	kube "k8s.io/client-go/kubernetes"
 	kuberest "k8s.io/client-go/rest"
 	kubeclientcmd "k8s.io/client-go/tools/clientcmd"
 
 	log "github.com/altinity/clickhouse-operator/pkg/announcer"
+	v1 "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
+	"github.com/altinity/clickhouse-operator/pkg/apis/deployment"
 	chopclientset "github.com/altinity/clickhouse-operator/pkg/client/clientset/versioned"
 	"github.com/altinity/clickhouse-operator/pkg/version"
 )
@@ -63,24 +66,57 @@ func getKubeConfig(kubeConfigFile, masterURL string) (*kuberest.Config, error) {
 }
 
 // GetClientset gets k8s API clients - both kube native client and our custom client
-func GetClientset(kubeConfigFile, masterURL string) (*kube.Clientset, *chopclientset.Clientset) {
+func GetClientset(kubeConfigFile, masterURL string) (
+	*kube.Clientset,
+	*apiextensions.Clientset,
+	*chopclientset.Clientset,
+) {
 	kubeConfig, err := getKubeConfig(kubeConfigFile, masterURL)
 	if err != nil {
-		log.A().Fatal("Unable to build kubeconf: %s", err.Error())
+		log.F().Fatal("Unable to build kubeconf: %s", err.Error())
 		os.Exit(1)
+	}
+
+	// Layer on k8s client rate limiting overrides if specified in CHOP config.
+	if maybeQps := os.Getenv(deployment.OPERATOR_K8S_CLIENT_QPS_LIMIT); maybeQps != "" {
+		parsedQps, err := strconv.ParseFloat(maybeQps, 32)
+		if err != nil || parsedQps <= 0 {
+			log.F().Fatal(
+				"Invalid value set for %s, expecting a nonzero float32, got %s",
+				deployment.OPERATOR_K8S_CLIENT_QPS_LIMIT,
+				maybeQps,
+			)
+		}
+		kubeConfig.QPS = float32(parsedQps)
+	}
+	if maybeBurst := os.Getenv(deployment.OPERATOR_K8S_CLIENT_BURST_LIMIT); maybeBurst != "" {
+		parsedBurst, err := strconv.ParseInt(maybeBurst, 10, 64)
+		if err != nil || parsedBurst <= 0 {
+			log.F().Fatal(
+				"Invalid value set for %s, expecting a nonzero integer, got %s",
+				deployment.OPERATOR_K8S_CLIENT_BURST_LIMIT,
+				maybeBurst,
+			)
+		}
+		kubeConfig.Burst = int(parsedBurst)
 	}
 
 	kubeClientset, err := kube.NewForConfig(kubeConfig)
 	if err != nil {
-		log.A().Fatal("Unable to initialize kubernetes API clientset: %s", err.Error())
+		log.F().Fatal("Unable to initialize kubernetes API clientset: %s", err.Error())
+	}
+
+	apiextensionsClientset, err := apiextensions.NewForConfig(kubeConfig)
+	if err != nil {
+		log.F().Fatal("Unable to initialize kubernetes API extensions clientset: %s", err.Error())
 	}
 
 	chopClientset, err := chopclientset.NewForConfig(kubeConfig)
 	if err != nil {
-		log.A().Fatal("Unable to initialize clickhouse-operator API clientset: %s", err.Error())
+		log.F().Fatal("Unable to initialize clickhouse-operator API clientset: %s", err.Error())
 	}
 
-	return kubeClientset, chopClientset
+	return kubeClientset, apiextensionsClientset, chopClientset
 }
 
 var chop *CHOp
@@ -89,9 +125,9 @@ var chop *CHOp
 // chopClient can be nil, in this case CHOp will not be able to use any ConfigMap(s) with configuration
 func New(kubeClient *kube.Clientset, chopClient *chopclientset.Clientset, initCHOpConfigFilePath string) {
 	// Create operator instance
-	chop = NewCHOp(version.Version, kubeClient, chopClient, initCHOpConfigFilePath)
+	chop = NewCHOp(version.Version, version.GitSHA, version.BuiltAt, kubeClient, chopClient, initCHOpConfigFilePath)
 	if err := chop.Init(); err != nil {
-		log.A().Fatal("Unable to init CHOP instance %v", err)
+		log.F().Fatal("Unable to init CHOP instance %v", err)
 		os.Exit(1)
 	}
 	chop.SetupLog()

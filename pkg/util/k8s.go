@@ -14,23 +14,70 @@
 
 package util
 
-import "k8s.io/apimachinery/pkg/apis/meta/v1"
+import (
+	core "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+)
+
+type iNamespaceName interface {
+	GetNamespace() string
+	GetName() string
+}
 
 // NamespaceName returns namespace and anme from the meta
-func NamespaceName(meta v1.ObjectMeta) (string, string) {
-	return meta.Namespace, meta.Name
+func NamespaceName(meta iNamespaceName) (string, string) {
+	return meta.GetNamespace(), meta.GetName()
 }
 
 // NamespaceNameString returns namespace and name as one string
-func NamespaceNameString(meta v1.ObjectMeta) string {
-	return meta.Namespace + "/" + meta.Name
+func NamespaceNameString(meta iNamespaceName) string {
+	return meta.GetNamespace() + "/" + meta.GetName()
+}
+
+// NamespacedName returns NamespacedName from obj
+func NamespacedName(obj iNamespaceName) types.NamespacedName {
+	return types.NamespacedName{
+		Namespace: obj.GetNamespace(),
+		Name:      obj.GetName(),
+	}
+}
+
+// AnnotationsToBeSkipped kubectl service annotation that we'd like to skip
+var AnnotationsToBeSkipped = []string{
+	"kubectl.kubernetes.io/last-applied-configuration",
 }
 
 // IsAnnotationToBeSkipped checks whether an annotation should be skipped
 func IsAnnotationToBeSkipped(annotation string) bool {
-	switch annotation {
-	case "kubectl.kubernetes.io/last-applied-configuration":
-		return true
+	for _, a := range AnnotationsToBeSkipped {
+		if a == annotation {
+			return true
+		}
+	}
+	return false
+}
+
+// ListSkippedAnnotations provides list of annotations that should be skipped
+func ListSkippedAnnotations() []string {
+	return AnnotationsToBeSkipped
+}
+
+// MergeEnvVars appends to `to` elements from `from` which are not found in `to`
+func MergeEnvVars(to []core.EnvVar, from ...core.EnvVar) []core.EnvVar {
+	for _, candidate := range from {
+		if !HasEnvVar(to, candidate) {
+			to = append(to, candidate)
+		}
+	}
+	return to
+}
+
+// HasEnvVar checks whether a haystack has a needle
+func HasEnvVar(haystack []core.EnvVar, needle core.EnvVar) bool {
+	for _, envVar := range haystack {
+		if needle.Name == envVar.Name {
+			return true
+		}
 	}
 	return false
 }

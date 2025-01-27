@@ -13,29 +13,88 @@ metadata:
     annotation2: annotation2_value
 
 spec:
+  # Allows to define custom taskID for CHI update and watch status of this update execution.
+  # Displayed in all .status.taskID* fields.
+  # By default (if not filled) every update of CHI manifest will generate random taskID
+  taskID: "qweqwe"
 
+  # Allows to stop all ClickHouse clusters defined in a CHI.
+  # Works as the following:
+  #  - When `stop` is `1` operator sets `Replicas: 0` in each StatefulSet. Thie leads to having all `Pods` and `Service` deleted. All PVCs are kept intact.
+  #  - When `stop` is `0` operator sets `Replicas: 1` and `Pod`s and `Service`s will created again and all retained PVCs will be attached to `Pod`s.
   stop: "no"
+
+  # In case 'RollingUpdate' specified, the operator will always restart ClickHouse pods during reconcile.
+  # This options is used in rare cases when force restart is required and is typically removed after the use in order to avoid unneeded restarts.
   restart: "RollingUpdate"
+
+  # Allows to troubleshoot Pods during CrashLoopBack state.
+  # This may happen when wrong configuration applied, in this case `clickhouse-server` wouldn't start.
+  # Command within ClickHouse container is modified with `sleep` in order to avoid quick restarts
+  # and give time to troubleshoot via CLI.
+  # Liveness and Readiness probes are disabled as well.
   troubleshoot: "no"
 
+  # Custom domain pattern which will be used for DNS names of `Service` or `Pod`.
+  # Typical use scenario - custom cluster domain in Kubernetes cluster
   namespaceDomainPattern:  "%s.svc.my.test"
 
+  # Optional, applicable inside ClickHouseInstallationTemplate only.
+  # Defines current ClickHouseInstallationTemplate application policy to target ClickHouseInstallation(s)."
   templating:
+    # When defined as `auto` inside ClickhouseInstallationTemplate, this ClickhouseInstallationTemplate
+    # will be auto-added into ClickHouseInstallation, selectable by `chiSelector`.
+    # Default value is `manual`, meaning ClickHouseInstallation should request this ClickhouseInstallationTemplate explicitly.
+    # Possible values:
+    #  - "auto"
+    #  - "manual"
     policy: "manual"
+    # Optional, defines selector for ClickHouseInstallation(s) to be templated with ClickhouseInstallationTemplate
+    chiSelector:
+      name1: value1
+      name2: value2
+    # TODO introduce one-time actions
+    # chiTaskID: "qweqwe"
+    # autoPurge: "yes"
 
+  # Optional, allows tuning reconciling cycle for ClickhouseInstallation from clickhouse-operator side
   reconciling:
+    # DISCUSSED TO BE DEPRECATED
+    # Syntax sugar
+    # Overrides all three 'reconcile.host.wait.{exclude, queries, include}' values from the operator's config
+    # Possible values:
+    #  - wait - should wait to exclude host, complete queries and include host back into the cluster
+    #  - nowait - should NOT wait to exclude host, complete queries and include host back into the cluster
     policy: "nowait"
+
+    # Timeout in seconds for `clickhouse-operator` to wait for modified `ConfigMap` to propagate into the `Pod`
+    # More details: https://kubernetes.io/docs/concepts/configuration/configmap/#mounted-configmaps-are-updated-automatically
     configMapPropagationTimeout: 90
+
+    # Optional, defines behavior for cleanup Kubernetes resources during reconcile cycle
     cleanup:
+      # Describes what clickhouse-operator should do with found Kubernetes resources which should be managed by clickhouse-operator,
+      # but do not have `ownerReference` to any currently managed `ClickHouseInstallation` resource.
+      # Default behavior is `Delete`"
       unknownObjects:
+        # Behavior policy for unknown PVC, `Delete` by default
         statefulSet: Delete
+        # Behavior policy for unknown PVC, `Delete` by default
         pvc: Delete
+        # Behavior policy for unknown ConfigMap, `Delete` by default
         configMap: Delete
+        # Behavior policy for unknown Service, `Delete` by default
         service: Delete
+      # Describes what clickhouse-operator should do with Kubernetes resources which are failed during reconcile.
+      # Default behavior is `Retain`"
       reconcileFailedObjects:
+        # Behavior policy for failed StatefulSet, `Retain` by default
         statefulSet: Retain
+        # Behavior policy for failed PVC, `Retain` by default
         pvc: Retain
+        # Behavior policy for failed ConfigMap, `Retain` by default
         configMap: Retain
+        # Behavior policy for failed Service, `Retain` by default
         service: Retain
 
   # List of templates used by a CHI
@@ -50,9 +109,21 @@ spec:
     replicasUseFQDN: "no"
     distributedDDL:
       profile: default
+    storageManagement:
+      # Specify PVC provisioner.
+      # 1. StatefulSet. PVC would be provisioned by the StatefulSet
+      # 2. Operator. PVC would be provisioned by the operator
+      provisioner: StatefulSet
+
+      # Specify PVC reclaim policy.
+      # 1. Retain. Keep PVC from being deleted
+      #    Retaining PVC will also keep backing PV from deletion. This is useful in case we need to keep data intact.
+      # 2. Delete
+      reclaimPolicy: Retain
+
     templates:
       hostTemplate: host-template-custom-ports
-      podTemplate: clickhouse-v20.6
+      podTemplate: clickhouse-v23.8
       dataVolumeClaimTemplate: default-volume-claim
       logVolumeClaimTemplate: default-volume-claim
       serviceTemplate: chi-service-template
@@ -132,16 +203,19 @@ spec:
 
       - name: all-counts
         templates:
-          podTemplate: clickhouse-v20.6
+          podTemplate: clickhouse-v23.8
           dataVolumeClaimTemplate: default-volume-claim
           logVolumeClaimTemplate: default-volume-claim
+        schemaPolicy:
+          replica: All
+          shard: All
         layout:
           shardsCount: 3
           replicasCount: 2
 
       - name: shards-only
         templates:
-          podTemplate: clickhouse-v20.6
+          podTemplate: clickhouse-v23.8
           dataVolumeClaimTemplate: default-volume-claim
           logVolumeClaimTemplate: default-volume-claim
         layout:
@@ -150,7 +224,7 @@ spec:
 
       - name: replicas-only
         templates:
-          podTemplate: clickhouse-v20.6
+          podTemplate: clickhouse-v23.8
           dataVolumeClaimTemplate: default-volume-claim
           logVolumeClaimTemplate: default-volume-claim
         layout:
@@ -159,9 +233,12 @@ spec:
 
       - name: customized
         templates:
-          podTemplate: clickhouse-v20.6
+          podTemplate: clickhouse-v23.8
           dataVolumeClaimTemplate: default-volume-claim
           logVolumeClaimTemplate: default-volume-claim
+        schemaPolicy:
+          replica: None
+          shard: None
         layout:
           shards:
             - name: shard0
@@ -169,13 +246,13 @@ spec:
               weight: 1
               internalReplication: Disabled
               templates:
-                podTemplate: clickhouse-v20.6
+                podTemplate: clickhouse-v23.8
                 dataVolumeClaimTemplate: default-volume-claim
                 logVolumeClaimTemplate: default-volume-claim
 
             - name: shard1
               templates:
-                podTemplate: clickhouse-v20.6
+                podTemplate: clickhouse-v23.8
                 dataVolumeClaimTemplate: default-volume-claim
                 logVolumeClaimTemplate: default-volume-claim
               replicas:
@@ -186,7 +263,7 @@ spec:
             - name: shard2
               replicasCount: 3
               templates:
-                podTemplate: clickhouse-v20.6
+                podTemplate: clickhouse-v23.8
                 dataVolumeClaimTemplate: default-volume-claim
                 logVolumeClaimTemplate: default-volume-claim
                 replicaServiceTemplate: replica-service-template
@@ -196,18 +273,52 @@ spec:
                   httpPort: 8123
                   interserverHTTPPort: 9009
                   templates:
-                    podTemplate: clickhouse-v20.7
+                    podTemplate: clickhouse-v23.8
                     dataVolumeClaimTemplate: default-volume-claim
                     logVolumeClaimTemplate: default-volume-claim
                     replicaServiceTemplate: replica-service-template
 
+      - name: with-secret
+        # Insecure communication.
+        # Opens/Closes insecure ports
+        insecure: "yes"
+        # Secure communication.
+        # Opens/Closes secure ports
+        # Translates into <secure>1</secure> ClickHouse setting for remote replicas
+        secure: "yes"
+        # Shared secret value to secure cluster communications
+        secret:
+          # Auto-generate shared secret value to secure cluster communications
+          auto: "True"
+          # Cluster shared secret value in plain text
+          value: "plaintext secret"
+          # Cluster shared secret source
+          valueFrom:
+            secretKeyRef:
+              name: "SecretName"
+              key: "Key"
+        layout:
+          shardsCount: 2
+
   templates:
     hostTemplates:
       - name: host-template-custom-ports
+        portDistribution:
+          - type: "ClusterScopeIndex"
         spec:
+          # Insecure communication.
+          # Opens/Closes insecure ports
+          insecure: "yes"
+          # Secure communication.
+          # Opens/Closes secure ports
+          # Translates into <secure>1</secure> ClickHouse setting for remote replicas
+          secure: "no"
           tcpPort: 7000
           httpPort: 7001
           interserverHTTPPort: 7002
+          #settings:
+          #files:
+          #templates:
 
     serviceTemplates:
       - name: chi-service-template
@@ -313,6 +424,21 @@ spec:
 
     volumeClaimTemplates:
       - name: default-volume-claim
+        # Specify PVC provisioner.
+        # 1. StatefulSet. PVC would be provisioned by the StatefulSet
+        # 2. Operator. PVC would be provisioned by the operator
+        provisioner: StatefulSet
+
+        # Specify PVC reclaim policy.
+        # 1. Retain. Keep PVC from being deleted
+        #    Retaining PVC will also keep backing PV from deletion. This is useful in case we need to keep data intact.
+        # 2. Delete
+        reclaimPolicy: Retain
+
+        # type ObjectMeta struct {} from k8s.io/meta/v1
+        metadata:
+          labels:
+            a: "b"
         # type PersistentVolumeClaimSpec struct from k8s.io/core/v1
         spec:
           # 1. If storageClassName is not specified, default StorageClass
@@ -326,10 +452,23 @@ spec:
           resources:
             requests:
               storage: 1Gi
+
       - name: volume-claim-retain-pvc
-        # Keep PVC from being deleted
-        # Retaining PVC will also keep backing PV from deletion. This is useful in case we need to keep data intact.
+        # Specify PVC provisioner.
+        # 1. StatefulSet. PVC would be provisioned by the StatefulSet
+        # 2. Operator. PVC would be provisioned by the operator
+        provisioner: StatefulSet
+
+        # Specify PVC reclaim policy.
+        # 1. Retain. Keep PVC from being deleted
+        #    Retaining PVC will also keep backing PV from deletion. This is useful in case we need to keep data intact.
+        # 2. Delete
         reclaimPolicy: Retain
+
+        # type ObjectMeta struct {} from k8s.io/meta/v1
+        metadata:
+          labels:
+            a: "b"
         # type PersistentVolumeClaimSpec struct from k8s.io/core/v1
         spec:
           # 1. If storageClassName is not specified, default StorageClass
@@ -347,7 +486,7 @@ spec:
     podTemplates:
       # multiple pod templates makes possible to update version smoothly
       # pod template for ClickHouse v18.16.1
-      - name: clickhouse-v20.7
+      - name: clickhouse-v23.8
         # We may need to label nodes with clickhouse=allow label for this example to run
         # See ./label_nodes.sh for this purpose
         zone:
@@ -422,11 +561,15 @@ spec:
             # Apply podDistribution on per-zone basis
             #topologyKey: "kubernetes.io/zone"
 
+        # type ObjectMeta struct {} from k8s.io/meta/v1
+        metadata:
+          labels:
+            a: "b"
         # type PodSpec struct {} from k8s.io/core/v1
         spec:
           containers:
             - name: clickhouse
-              image: yandex/clickhouse-server:20.7
+              image: clickhouse/clickhouse-server:23.8
               volumeMounts:
                 - name: default-volume-claim
                   mountPath: /var/lib/clickhouse
@@ -437,14 +580,26 @@ spec:
                 limits:
                   memory: "64Mi"
                   cpu: "100m"
+            - name: clickhouse-log
+              image: clickhouse/clickhouse-server:23.8
+              command:
+                - "/bin/sh"
+                - "-c"
+                - "--"
+              args:
+                - "while true; do sleep 30; done;"
 
-      # pod template for ClickHouse v19.11.3.11
-      - name: clickhouse-v20.6
+      # pod template for ClickHouse v23.8
+      - name: clickhouse-v23.8
+        # type ObjectMeta struct {} from k8s.io/meta/v1
+        metadata:
+          labels:
+            a: "b"
         # type PodSpec struct {} from k8s.io/core/v1
         spec:
           containers:
             - name: clickhouse
-              image: yandex/clickhouse-server:20.6
+              image: clickhouse/clickhouse-server:23.8
               volumeMounts:
                 - name: default-volume-claim
                   mountPath: /var/lib/clickhouse
@@ -455,3 +610,11 @@ spec:
                 limits:
                   memory: "64Mi"
                   cpu: "100m"
+            - name: clickhouse-log
+              image: clickhouse/clickhouse-server:23.8
+              command:
+                - "/bin/sh"
+                - "-c"
+                - "--"
+              args:
+                - "while true; do sleep 30; done;"

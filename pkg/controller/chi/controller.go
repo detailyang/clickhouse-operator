@@ -18,49 +18,86 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
+	"github.com/sanity-io/litter"
 	"gopkg.in/d4l3k/messagediff.v1"
+
 	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
+	apiExtensions "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	kubeTypes "k8s.io/apimachinery/pkg/types"
+	utilRuntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	kubeinformers "k8s.io/client-go/informers"
+	kubeInformers "k8s.io/client-go/informers"
 	kube "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
-	typedcore "k8s.io/client-go/kubernetes/typed/core/v1"
+	typedCore "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 
 	"github.com/altinity/queue"
 
 	log "github.com/altinity/clickhouse-operator/pkg/announcer"
-	chi "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
+	api "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
 	"github.com/altinity/clickhouse-operator/pkg/apis/metrics"
 	"github.com/altinity/clickhouse-operator/pkg/chop"
-	chopclientset "github.com/altinity/clickhouse-operator/pkg/client/clientset/versioned"
-	chopclientsetscheme "github.com/altinity/clickhouse-operator/pkg/client/clientset/versioned/scheme"
-	chopinformers "github.com/altinity/clickhouse-operator/pkg/client/informers/externalversions"
-	chopmodels "github.com/altinity/clickhouse-operator/pkg/model"
+	chopClientSet "github.com/altinity/clickhouse-operator/pkg/client/clientset/versioned"
+	chopClientSetScheme "github.com/altinity/clickhouse-operator/pkg/client/clientset/versioned/scheme"
+	chopInformers "github.com/altinity/clickhouse-operator/pkg/client/informers/externalversions"
+	"github.com/altinity/clickhouse-operator/pkg/controller"
+	"github.com/altinity/clickhouse-operator/pkg/controller/chi/cmd_queue"
+	chiKube "github.com/altinity/clickhouse-operator/pkg/controller/chi/kube"
+	ctrlLabeler "github.com/altinity/clickhouse-operator/pkg/controller/chi/labeler"
+	"github.com/altinity/clickhouse-operator/pkg/interfaces"
+	"github.com/altinity/clickhouse-operator/pkg/metrics/clickhouse"
+	chiLabeler "github.com/altinity/clickhouse-operator/pkg/model/chi/tags/labeler"
+	"github.com/altinity/clickhouse-operator/pkg/model/common/action_plan"
+	"github.com/altinity/clickhouse-operator/pkg/model/common/volume"
+	"github.com/altinity/clickhouse-operator/pkg/model/managers"
 	"github.com/altinity/clickhouse-operator/pkg/util"
 )
 
+// Controller defines CRO controller
+type Controller struct {
+	// kube is a generalized kube client
+	kube interfaces.IKube
+
+	//
+	// Native clients
+	//
+	kubeClient kube.Interface
+	extClient  apiExtensions.Interface
+	chopClient chopClientSet.Interface
+
+	// queues used to organize events queue processed by the operator
+	queues []queue.PriorityQueue
+	// not used explicitly
+	recorder record.EventRecorder
+
+	namer       interfaces.INameManager
+	ctrlLabeler *ctrlLabeler.Labeler
+	pvcDeleter  *volume.PVCDeleter
+}
+
 // NewController creates instance of Controller
 func NewController(
-	chopClient chopclientset.Interface,
+	chopClient chopClientSet.Interface,
+	extClient apiExtensions.Interface,
 	kubeClient kube.Interface,
-	chopInformerFactory chopinformers.SharedInformerFactory,
-	kubeInformerFactory kubeinformers.SharedInformerFactory,
+	chopInformerFactory chopInformers.SharedInformerFactory,
+	kubeInformerFactory kubeInformers.SharedInformerFactory,
 ) *Controller {
 
 	// Initializations
-	_ = chopclientsetscheme.AddToScheme(scheme.Scheme)
+	_ = chopClientSetScheme.AddToScheme(scheme.Scheme)
 
 	// Setup events
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(log.Info)
 	eventBroadcaster.StartRecordingToSink(
-		&typedcore.EventSinkImpl{
+		&typedCore.EventSinkImpl{
 			Interface: kubeClient.CoreV1().Events(""),
 		},
 	)
@@ -71,25 +108,19 @@ func NewController(
 		},
 	)
 
+	namer := managers.NewNameManager(managers.NameManagerTypeClickHouse)
+	kube := chiKube.NewAdapter(kubeClient, chopClient, namer)
+
 	// Create Controller instance
 	controller := &Controller{
-		kubeClient:              kubeClient,
-		chopClient:              chopClient,
-		chiLister:               chopInformerFactory.Clickhouse().V1().ClickHouseInstallations().Lister(),
-		chiListerSynced:         chopInformerFactory.Clickhouse().V1().ClickHouseInstallations().Informer().HasSynced,
-		chitLister:              chopInformerFactory.Clickhouse().V1().ClickHouseInstallationTemplates().Lister(),
-		chitListerSynced:        chopInformerFactory.Clickhouse().V1().ClickHouseInstallationTemplates().Informer().HasSynced,
-		serviceLister:           kubeInformerFactory.Core().V1().Services().Lister(),
-		serviceListerSynced:     kubeInformerFactory.Core().V1().Services().Informer().HasSynced,
-		endpointsLister:         kubeInformerFactory.Core().V1().Endpoints().Lister(),
-		endpointsListerSynced:   kubeInformerFactory.Core().V1().Endpoints().Informer().HasSynced,
-		configMapLister:         kubeInformerFactory.Core().V1().ConfigMaps().Lister(),
-		configMapListerSynced:   kubeInformerFactory.Core().V1().ConfigMaps().Informer().HasSynced,
-		statefulSetLister:       kubeInformerFactory.Apps().V1().StatefulSets().Lister(),
-		statefulSetListerSynced: kubeInformerFactory.Apps().V1().StatefulSets().Informer().HasSynced,
-		podLister:               kubeInformerFactory.Core().V1().Pods().Lister(),
-		podListerSynced:         kubeInformerFactory.Core().V1().Pods().Informer().HasSynced,
-		recorder:                recorder,
+		kubeClient:  kubeClient,
+		extClient:   extClient,
+		chopClient:  chopClient,
+		recorder:    recorder,
+		namer:       namer,
+		kube:        kube,
+		ctrlLabeler: ctrlLabeler.New(kube),
+		pvcDeleter:  volume.NewPVCDeleter(managers.NewNameManager(managers.NameManagerTypeClickHouse)),
 	}
 	controller.initQueues()
 	controller.addEventHandlers(chopInformerFactory, kubeInformerFactory)
@@ -99,121 +130,126 @@ func NewController(
 
 // initQueues
 func (c *Controller) initQueues() {
-	for i := 0; i < chop.Config().ReconcileThreadsNumber+chi.DefaultReconcileSystemThreadsNumber; i++ {
-		c.queues = append(
-			c.queues,
-			queue.New(),
-			//workqueue.NewNamedRateLimitingQueue(
-			//	workqueue.DefaultControllerRateLimiter(),
-			//	fmt.Sprintf("chi%d", i),
-			//),
-		)
+	for i := 0; i < c.getQueuesNum(); i++ {
+		c.queues = append(c.queues, c.createQueue())
 	}
 }
 
+func (c *Controller) getQueuesNum() int {
+	return chop.Config().Reconcile.Runtime.ReconcileCHIsThreadsNumber + api.DefaultReconcileSystemThreadsNumber
+}
+
+func (c *Controller) createQueue() queue.PriorityQueue {
+	return queue.New()
+	//workqueue.NewNamedRateLimitingQueue(
+	//	workqueue.DefaultControllerRateLimiter(),
+	//	fmt.Sprintf("chi%d", i),
+	//),
+}
+
 func (c *Controller) addEventHandlersCHI(
-	chopInformerFactory chopinformers.SharedInformerFactory,
+	chopInformerFactory chopInformers.SharedInformerFactory,
 ) {
 	chopInformerFactory.Clickhouse().V1().ClickHouseInstallations().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			chi := obj.(*chi.ClickHouseInstallation)
-			if !chop.Config().IsWatchedNamespace(chi.Namespace) {
+			chi := obj.(*api.ClickHouseInstallation)
+			if !shouldEnqueue(chi) {
 				return
 			}
-			log.V(2).M(chi).Info("chiInformer.AddFunc")
-			c.enqueueObject(NewReconcileCHI(reconcileAdd, nil, chi))
+			log.V(3).M(chi).Info("chiInformer.AddFunc")
+			c.enqueueObject(cmd_queue.NewReconcileCHI(cmd_queue.ReconcileAdd, nil, chi))
 		},
 		UpdateFunc: func(old, new interface{}) {
-			oldChi := old.(*chi.ClickHouseInstallation)
-			newChi := new.(*chi.ClickHouseInstallation)
-			if !chop.Config().IsWatchedNamespace(newChi.Namespace) {
+			oldChi := old.(*api.ClickHouseInstallation)
+			newChi := new.(*api.ClickHouseInstallation)
+			if !shouldEnqueue(newChi) {
 				return
 			}
-			log.V(2).M(newChi).Info("chiInformer.UpdateFunc")
-			c.enqueueObject(NewReconcileCHI(reconcileUpdate, oldChi, newChi))
+			log.V(3).M(newChi).Info("chiInformer.UpdateFunc")
+			c.enqueueObject(cmd_queue.NewReconcileCHI(cmd_queue.ReconcileUpdate, oldChi, newChi))
 		},
 		DeleteFunc: func(obj interface{}) {
-			chi := obj.(*chi.ClickHouseInstallation)
+			chi := obj.(*api.ClickHouseInstallation)
 			if !chop.Config().IsWatchedNamespace(chi.Namespace) {
 				return
 			}
-			log.V(2).M(chi).Info("chiInformer.DeleteFunc")
-			c.enqueueObject(NewReconcileCHI(reconcileDelete, chi, nil))
+			log.V(3).M(chi).Info("chiInformer.DeleteFunc")
+			c.enqueueObject(cmd_queue.NewReconcileCHI(cmd_queue.ReconcileDelete, chi, nil))
 		},
 	})
 }
 
 func (c *Controller) addEventHandlersCHIT(
-	chopInformerFactory chopinformers.SharedInformerFactory,
+	chopInformerFactory chopInformers.SharedInformerFactory,
 ) {
 	chopInformerFactory.Clickhouse().V1().ClickHouseInstallationTemplates().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			chit := obj.(*chi.ClickHouseInstallationTemplate)
+			chit := obj.(*api.ClickHouseInstallationTemplate)
 			if !chop.Config().IsWatchedNamespace(chit.Namespace) {
 				return
 			}
-			log.V(2).M(chit).Info("chitInformer.AddFunc")
-			c.enqueueObject(NewReconcileCHIT(reconcileAdd, nil, chit))
+			log.V(3).M(chit).Info("chitInformer.AddFunc")
+			c.enqueueObject(cmd_queue.NewReconcileCHIT(cmd_queue.ReconcileAdd, nil, chit))
 		},
 		UpdateFunc: func(old, new interface{}) {
-			oldChit := old.(*chi.ClickHouseInstallationTemplate)
-			newChit := new.(*chi.ClickHouseInstallationTemplate)
+			oldChit := old.(*api.ClickHouseInstallationTemplate)
+			newChit := new.(*api.ClickHouseInstallationTemplate)
 			if !chop.Config().IsWatchedNamespace(newChit.Namespace) {
 				return
 			}
-			log.V(2).M(newChit).Info("chitInformer.UpdateFunc")
-			c.enqueueObject(NewReconcileCHIT(reconcileUpdate, oldChit, newChit))
+			log.V(3).M(newChit).Info("chitInformer.UpdateFunc")
+			c.enqueueObject(cmd_queue.NewReconcileCHIT(cmd_queue.ReconcileUpdate, oldChit, newChit))
 		},
 		DeleteFunc: func(obj interface{}) {
-			chit := obj.(*chi.ClickHouseInstallationTemplate)
+			chit := obj.(*api.ClickHouseInstallationTemplate)
 			if !chop.Config().IsWatchedNamespace(chit.Namespace) {
 				return
 			}
-			log.V(2).M(chit).Info("chitInformer.DeleteFunc")
-			c.enqueueObject(NewReconcileCHIT(reconcileDelete, chit, nil))
+			log.V(3).M(chit).Info("chitInformer.DeleteFunc")
+			c.enqueueObject(cmd_queue.NewReconcileCHIT(cmd_queue.ReconcileDelete, chit, nil))
 		},
 	})
 }
 
 func (c *Controller) addEventHandlersChopConfig(
-	chopInformerFactory chopinformers.SharedInformerFactory,
+	chopInformerFactory chopInformers.SharedInformerFactory,
 ) {
 	chopInformerFactory.Clickhouse().V1().ClickHouseOperatorConfigurations().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			chopConfig := obj.(*chi.ClickHouseOperatorConfiguration)
+			chopConfig := obj.(*api.ClickHouseOperatorConfiguration)
 			if !chop.Config().IsWatchedNamespace(chopConfig.Namespace) {
 				return
 			}
-			log.V(2).M(chopConfig).Info("chopInformer.AddFunc")
-			c.enqueueObject(NewReconcileChopConfig(reconcileAdd, nil, chopConfig))
+			log.V(3).M(chopConfig).Info("chopInformer.AddFunc")
+			c.enqueueObject(cmd_queue.NewReconcileChopConfig(cmd_queue.ReconcileAdd, nil, chopConfig))
 		},
 		UpdateFunc: func(old, new interface{}) {
-			newChopConfig := new.(*chi.ClickHouseOperatorConfiguration)
-			oldChopConfig := old.(*chi.ClickHouseOperatorConfiguration)
+			newChopConfig := new.(*api.ClickHouseOperatorConfiguration)
+			oldChopConfig := old.(*api.ClickHouseOperatorConfiguration)
 			if !chop.Config().IsWatchedNamespace(newChopConfig.Namespace) {
 				return
 			}
-			log.V(2).M(newChopConfig).Info("chopInformer.UpdateFunc")
-			c.enqueueObject(NewReconcileChopConfig(reconcileUpdate, oldChopConfig, newChopConfig))
+			log.V(3).M(newChopConfig).Info("chopInformer.UpdateFunc")
+			c.enqueueObject(cmd_queue.NewReconcileChopConfig(cmd_queue.ReconcileUpdate, oldChopConfig, newChopConfig))
 		},
 		DeleteFunc: func(obj interface{}) {
-			chopConfig := obj.(*chi.ClickHouseOperatorConfiguration)
+			chopConfig := obj.(*api.ClickHouseOperatorConfiguration)
 			if !chop.Config().IsWatchedNamespace(chopConfig.Namespace) {
 				return
 			}
-			log.V(2).M(chopConfig).Info("chopInformer.DeleteFunc")
-			c.enqueueObject(NewReconcileChopConfig(reconcileDelete, chopConfig, nil))
+			log.V(3).M(chopConfig).Info("chopInformer.DeleteFunc")
+			c.enqueueObject(cmd_queue.NewReconcileChopConfig(cmd_queue.ReconcileDelete, chopConfig, nil))
 		},
 	})
 }
 
 func (c *Controller) addEventHandlersService(
-	kubeInformerFactory kubeinformers.SharedInformerFactory,
+	kubeInformerFactory kubeInformers.SharedInformerFactory,
 ) {
 	kubeInformerFactory.Core().V1().Services().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			service := obj.(*core.Service)
-			if !c.isTrackedObject(&service.ObjectMeta) {
+			if !c.isTrackedObject(service.GetObjectMeta()) {
 				return
 			}
 			log.V(3).M(service).Info("serviceInformer.AddFunc")
@@ -235,8 +271,79 @@ func (c *Controller) addEventHandlersService(
 	})
 }
 
+func normalizeEndpoints(e *core.Endpoints) *core.Endpoints {
+	if e == nil {
+		e = &core.Endpoints{}
+	}
+	if len(e.Subsets) == 0 {
+		e.Subsets = []core.EndpointSubset{
+			{},
+		}
+	}
+	if len(e.Subsets[0].Addresses) == 0 {
+		e.Subsets[0].Addresses = []core.EndpointAddress{
+			{},
+		}
+	}
+	e.Subsets[0].Addresses[0].TargetRef = nil
+	return e
+}
+
+func checkIP(path *messagediff.Path, iValue interface{}) bool {
+	for _, pathNode := range *path {
+		// .String() function adds "." in front of the pathNode
+		// So it would be ".IP" for pathNode "IPs"
+		s := pathNode.String()
+		if s == ".IP" {
+			if typed, ok := iValue.(string); ok {
+				if typed != "" {
+					// Have IP address assigned|modified
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func updated(old, new *core.Endpoints) bool {
+	oldSubsets := normalizeEndpoints(old).Subsets
+	newSubsets := normalizeEndpoints(new).Subsets
+
+	diff, equal := messagediff.DeepDiff(oldSubsets[0].Addresses, newSubsets[0].Addresses)
+	if equal {
+		log.V(3).M(old).Info("endpointsInformer.UpdateFunc: no changes found")
+		// No need to react
+		return false
+	}
+
+	assigned := false
+	for path, iValue := range diff.Added {
+		log.V(3).M(old).Info("endpointsInformer.UpdateFunc: added %v", path)
+		if address, ok := iValue.(core.EndpointAddress); ok {
+			if address.IP != "" {
+				assigned = true
+			}
+		}
+	}
+	for path := range diff.Removed {
+		log.V(3).M(old).Info("endpointsInformer.UpdateFunc: removed %v", path)
+	}
+	for path, iValue := range diff.Modified {
+		log.V(3).M(old).Info("endpointsInformer.UpdateFunc: modified %v", path)
+		assigned = assigned || checkIP(path, iValue)
+	}
+
+	if assigned {
+		log.V(2).M(old).Info("endpointsInformer.UpdateFunc: IP ASSIGNED: %s", litter.Sdump(new.Subsets))
+		return true
+	}
+
+	return false
+}
+
 func (c *Controller) addEventHandlersEndpoint(
-	kubeInformerFactory kubeinformers.SharedInformerFactory,
+	kubeInformerFactory kubeInformers.SharedInformerFactory,
 ) {
 	kubeInformerFactory.Core().V1().Endpoints().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -252,34 +359,9 @@ func (c *Controller) addEventHandlersEndpoint(
 			if !c.isTrackedObject(&oldEndpoints.ObjectMeta) {
 				return
 			}
-
-			diff, equal := messagediff.DeepDiff(oldEndpoints, newEndpoints)
-			if equal {
-				log.V(2).M(oldEndpoints).Info("endpointsInformer.UpdateFunc: no changes found")
-				// No need to react
-				return
-			}
-
-			added := false
-			for path := range diff.Added {
-				log.V(2).M(oldEndpoints).Info("endpointsInformer.UpdateFunc: added %v", path)
-				for _, pathnode := range *path {
-					s := pathnode.String()
-					if s == ".Addresses" {
-						added = true
-					}
-				}
-			}
-			for path := range diff.Removed {
-				log.V(2).M(oldEndpoints).Info("endpointsInformer.UpdateFunc: removed %v", path)
-			}
-			for path := range diff.Modified {
-				log.V(2).M(oldEndpoints).Info("endpointsInformer.UpdateFunc: modified %v", path)
-			}
-
-			if added {
-				log.V(1).M(oldEndpoints).Info("endpointsInformer.UpdateFunc: IP ASSIGNED %v", newEndpoints.Subsets)
-				c.enqueueObject(NewDropDns(&newEndpoints.ObjectMeta))
+			log.V(3).M(newEndpoints).Info("endpointsInformer.UpdateFunc")
+			if updated(oldEndpoints, newEndpoints) {
+				c.enqueueObject(cmd_queue.NewReconcileEndpoints(cmd_queue.ReconcileUpdate, oldEndpoints, newEndpoints))
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -287,13 +369,13 @@ func (c *Controller) addEventHandlersEndpoint(
 			if !c.isTrackedObject(&endpoints.ObjectMeta) {
 				return
 			}
-			log.V(2).M(endpoints).Info("endpointsInformer.DeleteFunc")
+			log.V(3).M(endpoints).Info("endpointsInformer.DeleteFunc")
 		},
 	})
 }
 
 func (c *Controller) addEventHandlersConfigMap(
-	kubeInformerFactory kubeinformers.SharedInformerFactory,
+	kubeInformerFactory kubeInformers.SharedInformerFactory,
 ) {
 	kubeInformerFactory.Core().V1().ConfigMaps().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -321,7 +403,7 @@ func (c *Controller) addEventHandlersConfigMap(
 }
 
 func (c *Controller) addEventHandlersStatefulSet(
-	kubeInformerFactory kubeinformers.SharedInformerFactory,
+	kubeInformerFactory kubeInformers.SharedInformerFactory,
 ) {
 	kubeInformerFactory.Apps().V1().StatefulSets().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -351,7 +433,7 @@ func (c *Controller) addEventHandlersStatefulSet(
 }
 
 func (c *Controller) addEventHandlersPod(
-	kubeInformerFactory kubeinformers.SharedInformerFactory,
+	kubeInformerFactory kubeInformers.SharedInformerFactory,
 ) {
 	kubeInformerFactory.Core().V1().Pods().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -360,13 +442,16 @@ func (c *Controller) addEventHandlersPod(
 				return
 			}
 			log.V(3).M(pod).Info("podInformer.AddFunc")
+			c.enqueueObject(cmd_queue.NewReconcilePod(cmd_queue.ReconcileAdd, nil, pod))
 		},
 		UpdateFunc: func(old, new interface{}) {
-			pod := old.(*core.Pod)
-			if !c.isTrackedObject(&pod.ObjectMeta) {
+			oldPod := old.(*core.Pod)
+			newPod := new.(*core.Pod)
+			if !c.isTrackedObject(&newPod.ObjectMeta) {
 				return
 			}
-			log.V(3).M(pod).Info("podInformer.UpdateFunc")
+			log.V(3).M(newPod).Info("podInformer.UpdateFunc")
+			c.enqueueObject(cmd_queue.NewReconcilePod(cmd_queue.ReconcileUpdate, oldPod, newPod))
 		},
 		DeleteFunc: func(obj interface{}) {
 			pod := obj.(*core.Pod)
@@ -374,14 +459,15 @@ func (c *Controller) addEventHandlersPod(
 				return
 			}
 			log.V(3).M(pod).Info("podInformer.DeleteFunc")
+			c.enqueueObject(cmd_queue.NewReconcilePod(cmd_queue.ReconcileDelete, pod, nil))
 		},
 	})
 }
 
 // addEventHandlers
 func (c *Controller) addEventHandlers(
-	chopInformerFactory chopinformers.SharedInformerFactory,
-	kubeInformerFactory kubeinformers.SharedInformerFactory,
+	chopInformerFactory chopInformers.SharedInformerFactory,
+	kubeInformerFactory kubeInformers.SharedInformerFactory,
 ) {
 	c.addEventHandlersCHI(chopInformerFactory)
 	c.addEventHandlersCHIT(chopInformerFactory)
@@ -394,13 +480,13 @@ func (c *Controller) addEventHandlers(
 }
 
 // isTrackedObject checks whether operator is interested in changes of this object
-func (c *Controller) isTrackedObject(objectMeta *meta.ObjectMeta) bool {
-	return chop.Config().IsWatchedNamespace(objectMeta.Namespace) && chopmodels.IsCHOPGeneratedObject(objectMeta)
+func (c *Controller) isTrackedObject(meta meta.Object) bool {
+	return chop.Config().IsWatchedNamespace(meta.GetNamespace()) && chiLabeler.New(nil).IsCHOPGeneratedObject(meta)
 }
 
 // Run syncs caches, starts workers
 func (c *Controller) Run(ctx context.Context) {
-	defer utilruntime.HandleCrash()
+	defer utilRuntime.HandleCrash()
 	defer func() {
 		for i := range c.queues {
 			//c.queues[i].ShutDown()
@@ -409,118 +495,121 @@ func (c *Controller) Run(ctx context.Context) {
 	}()
 
 	log.V(1).Info("Starting ClickHouseInstallation controller")
-	if !waitForCacheSync(
-		ctx,
-		"ClickHouseInstallation",
-		c.chiListerSynced,
-		c.statefulSetListerSynced,
-		c.configMapListerSynced,
-		c.serviceListerSynced,
-	) {
-		// Unable to sync
-		return
-	}
 
 	// Label controller runtime objects with proper labels
-	c.labelMyObjectsTree(ctx)
+	max := 10
+	for cnt := 0; cnt < max; cnt++ {
+		switch err := c.ctrlLabeler.LabelMyObjectsTree(ctx); err {
+		case nil:
+			cnt = max
+		case ctrlLabeler.ErrOperatorPodNotSpecified:
+			log.V(1).F().Error("Since operator pod is not specified, will not perform labeling")
+			cnt = max
+		default:
+			log.V(1).F().Error("ERROR label objects, will retry. Err: %v", err)
+			util.WaitContextDoneOrTimeout(ctx, 5*time.Second)
+		}
+	}
 
 	//
 	// Start threads
 	//
 	workersNum := len(c.queues)
-	log.V(1).A().Info("ClickHouseInstallation controller: starting workers number: %d", workersNum)
+	log.V(1).F().Info("ClickHouseInstallation controller: starting workers number: %d", workersNum)
 	for i := 0; i < workersNum; i++ {
-		log.V(1).A().Info("ClickHouseInstallation controller: starting worker %d out of %d", i+1, workersNum)
-		worker := c.newWorker(c.queues[i])
+		log.V(1).F().Info("ClickHouseInstallation controller: starting worker %d out of %d", i+1, workersNum)
+		sys := false
+		if i < api.DefaultReconcileSystemThreadsNumber {
+			sys = true
+		}
+		worker := c.newWorker(c.queues[i], sys)
 		go wait.Until(worker.run, runWorkerPeriod, ctx.Done())
 	}
-	defer log.V(1).A().Info("ClickHouseInstallation controller: shutting down workers")
+	defer log.V(1).F().Info("ClickHouseInstallation controller: shutting down workers")
 
-	log.V(1).A().Info("ClickHouseInstallation controller: workers started")
+	log.V(1).F().Info("ClickHouseInstallation controller: workers started")
 	<-ctx.Done()
+}
+
+func prepareCHIAdd(command *cmd_queue.ReconcileCHI) bool {
+	newjs, _ := json.Marshal(command.New)
+	newchi := api.ClickHouseInstallation{
+		TypeMeta: meta.TypeMeta{
+			APIVersion: api.SchemeGroupVersion.String(),
+			Kind:       api.ClickHouseInstallationCRDResourceKind,
+		},
+	}
+	_ = json.Unmarshal(newjs, &newchi)
+	command.New = &newchi
+	logCommand(command)
+	return true
+}
+
+func prepareCHIUpdate(command *cmd_queue.ReconcileCHI) bool {
+	actionPlan := action_plan.NewActionPlan(command.Old, command.New)
+	if !actionPlan.HasActionsToDo() {
+		return false
+	}
+	oldjson, _ := json.MarshalIndent(command.Old, "", "  ")
+	newjson, _ := json.MarshalIndent(command.New, "", "  ")
+	log.V(2).Info("AP enqueue---------------------------------------------:\n%s\n", actionPlan)
+	log.V(3).Info("old enqueue--------------------------------------------:\n%s\n", string(oldjson))
+	log.V(3).Info("new enqueue--------------------------------------------:\n%s\n", string(newjson))
+
+	oldjs, _ := json.Marshal(command.Old)
+	newjs, _ := json.Marshal(command.New)
+	oldchi := api.ClickHouseInstallation{}
+	newchi := api.ClickHouseInstallation{
+		TypeMeta: meta.TypeMeta{
+			APIVersion: api.SchemeGroupVersion.String(),
+			Kind:       api.ClickHouseInstallationCRDResourceKind,
+		},
+	}
+	_ = json.Unmarshal(oldjs, &oldchi)
+	_ = json.Unmarshal(newjs, &newchi)
+	command.Old = &oldchi
+	command.New = &newchi
+	logCommand(command)
+	return true
+}
+
+func logCommand(command *cmd_queue.ReconcileCHI) {
+	namespace := "uns"
+	name := "un"
+	switch {
+	case command.New != nil:
+		namespace = command.New.Namespace
+		name = command.New.Name
+	case command.Old != nil:
+		namespace = command.Old.Namespace
+		name = command.Old.Name
+	}
+	log.V(1).Info("ENQUEUE new ReconcileCHI cmd=%s for %s/%s", command.Cmd, namespace, name)
 }
 
 // enqueueObject adds ClickHouseInstallation object to the work queue
 func (c *Controller) enqueueObject(obj queue.PriorityQueueItem) {
 	handle := []byte(obj.Handle().(string))
 	index := 0
-	enqueue := true
+	enqueue := false
 	switch command := obj.(type) {
-	case *ReconcileCHI:
-		variants := len(c.queues) - chi.DefaultReconcileSystemThreadsNumber
-		index = chi.DefaultReconcileSystemThreadsNumber + util.HashIntoIntTopped(handle, variants)
-		switch command.cmd {
-		case reconcileAdd:
-			newjs, _ := json.Marshal(command.new)
-			newchi := chi.ClickHouseInstallation{
-				TypeMeta: meta.TypeMeta{
-					APIVersion: chi.SchemeGroupVersion.String(),
-					Kind:       chi.ClickHouseInstallationCRDResourceKind,
-				},
-			}
-			_ = json.Unmarshal(newjs, &newchi)
-			command.new = &newchi
-		case reconcileUpdate:
-			actionPlan := chopmodels.NewActionPlan(command.old, command.new)
-			enqueue = actionPlan.HasActionsToDo()
-			if enqueue {
-				log.V(2).Info("actionPlan:\n%s", actionPlan)
-				//oldjson, _ := json.MarshalIndent(command.old, "", "  ")
-				//newjson, _ := json.MarshalIndent(command.new, "", "  ")
-				//log.V(3).Infof("AP---------------------------------------------:\n%s\n", actionPlan)
-				//log.V(3).Infof("old--------------------------------------------:\n%s\n", string(oldjson))
-				//log.V(3).Infof("new--------------------------------------------:\n%s\n", string(newjson))
-
-				//if len(command.old.Spec.Configuration.Clusters) > 0 {
-				//	if command.old.Spec.Configuration.Clusters[0].Address.Namespace != "" ||
-				//		command.old.Spec.Configuration.Clusters[0].Address.CHIName != "" ||
-				//		command.old.Spec.Configuration.Clusters[0].Address.ClusterName != "" {
-				//		log.V(1).Error("ERROR CHI: NON-EMPTY CHI OLD")
-				//	}
-				//}
-				//if len(command.new.Spec.Configuration.Clusters) > 0 {
-				//	if command.new.Spec.Configuration.Clusters[0].Address.Namespace != "" ||
-				//		command.new.Spec.Configuration.Clusters[0].Address.CHIName != "" ||
-				//		command.new.Spec.Configuration.Clusters[0].Address.ClusterName != "" {
-				//		log.V(1).Error("ERROR CHI: NON-EMPTY CHI NEW")
-				//	}
-				//}
-
-				oldjs, _ := json.Marshal(command.old)
-				newjs, _ := json.Marshal(command.new)
-				oldchi := chi.ClickHouseInstallation{}
-				newchi := chi.ClickHouseInstallation{
-					TypeMeta: meta.TypeMeta{
-						APIVersion: chi.SchemeGroupVersion.String(),
-						Kind:       chi.ClickHouseInstallationCRDResourceKind,
-					},
-				}
-				_ = json.Unmarshal(oldjs, &oldchi)
-				_ = json.Unmarshal(newjs, &newchi)
-				command.old = &oldchi
-				command.new = &newchi
-			}
+	case *cmd_queue.ReconcileCHI:
+		variants := len(c.queues) - api.DefaultReconcileSystemThreadsNumber
+		index = api.DefaultReconcileSystemThreadsNumber + util.HashIntoIntTopped(handle, variants)
+		switch command.Cmd {
+		case cmd_queue.ReconcileAdd:
+			enqueue = prepareCHIAdd(command)
+		case cmd_queue.ReconcileUpdate:
+			enqueue = prepareCHIUpdate(command)
 		}
-		if enqueue {
-			namespace := "uns"
-			name := "un"
-			switch {
-			case command.new != nil:
-				namespace = command.new.Namespace
-				name = command.new.Name
-			case command.old != nil:
-				namespace = command.old.Namespace
-				name = command.old.Name
-			}
-			log.V(1).Info("ENQUEUE new ReconcileCHI cmd=%s for %s/%s", command.cmd, namespace, name)
-		}
-
 	case
-		*ReconcileCHIT,
-		*ReconcileChopConfig,
-		*DropDns:
-		variants := chi.DefaultReconcileSystemThreadsNumber
+		*cmd_queue.ReconcileCHIT,
+		*cmd_queue.ReconcileChopConfig,
+		*cmd_queue.ReconcileEndpoints,
+		*cmd_queue.ReconcilePod:
+		variants := api.DefaultReconcileSystemThreadsNumber
 		index = util.HashIntoIntTopped(handle, variants)
+		enqueue = true
 	}
 	if enqueue {
 		//c.queues[index].AddRateLimited(obj)
@@ -529,62 +618,37 @@ func (c *Controller) enqueueObject(obj queue.PriorityQueueItem) {
 }
 
 // updateWatch
-func (c *Controller) updateWatch(namespace, name string, hostnames []string) {
-	go c.updateWatchAsync(namespace, name, hostnames)
+func (c *Controller) updateWatch(chi *api.ClickHouseInstallation) {
+	watched := metrics.NewWatchedCR(chi)
+	go c.updateWatchAsync(watched)
 }
 
 // updateWatchAsync
-func (c *Controller) updateWatchAsync(namespace, name string, hostnames []string) {
-	if err := metrics.InformMetricsExporterAboutWatchedCHI(namespace, name, hostnames); err != nil {
-		log.V(1).A().Info("FAIL update watch (%s/%s): %q", namespace, name, err)
+func (c *Controller) updateWatchAsync(chi *metrics.WatchedCR) {
+	if err := clickhouse.InformMetricsExporterAboutWatchedCHI(chi); err != nil {
+		log.V(1).F().Info("FAIL update watch (%s/%s): %q", chi.Namespace, chi.Name, err)
 	} else {
-		log.V(2).Info("OK update watch (%s/%s)", namespace, name)
+		log.V(1).Info("OK update watch (%s/%s): %s", chi.Namespace, chi.Name, chi)
 	}
 }
 
 // deleteWatch
-func (c *Controller) deleteWatch(namespace, name string) {
-	go c.deleteWatchAsync(namespace, name)
+func (c *Controller) deleteWatch(chi *api.ClickHouseInstallation) {
+	watched := metrics.NewWatchedCR(chi)
+	go c.deleteWatchAsync(watched)
 }
 
 // deleteWatchAsync
-func (c *Controller) deleteWatchAsync(namespace, name string) {
-	if err := metrics.InformMetricsExporterToDeleteWatchedCHI(namespace, name); err != nil {
-		log.V(1).A().Info("FAIL delete watch (%s/%s): %q", namespace, name, err)
+func (c *Controller) deleteWatchAsync(chi *metrics.WatchedCR) {
+	if err := clickhouse.InformMetricsExporterToDeleteWatchedCHI(chi); err != nil {
+		log.V(1).F().Info("FAIL delete watch (%s/%s): %q", chi.Namespace, chi.Name, err)
 	} else {
-		log.V(2).Info("OK delete watch (%s/%s)", namespace, name)
+		log.V(1).Info("OK delete watch (%s/%s)", chi.Namespace, chi.Name)
 	}
-}
-
-// addChit sync new CHIT - creates all its resources
-func (c *Controller) addChit(chit *chi.ClickHouseInstallationTemplate) error {
-	log.V(1).M(chit).F().P()
-	chop.Config().AddCHITemplate((*chi.ClickHouseInstallation)(chit))
-	return nil
-}
-
-// updateChit sync CHIT which was already created earlier
-func (c *Controller) updateChit(old, new *chi.ClickHouseInstallationTemplate) error {
-	if old.ObjectMeta.ResourceVersion == new.ObjectMeta.ResourceVersion {
-		log.V(2).M(old).F().Info("ResourceVersion did not change: %s", old.ObjectMeta.ResourceVersion)
-		// No need to react
-		return nil
-	}
-
-	log.V(2).M(new).F().Info("ResourceVersion change: %s to %s", old.ObjectMeta.ResourceVersion, new.ObjectMeta.ResourceVersion)
-	chop.Config().UpdateCHITemplate((*chi.ClickHouseInstallation)(new))
-	return nil
-}
-
-// deleteChit deletes CHIT
-func (c *Controller) deleteChit(chit *chi.ClickHouseInstallationTemplate) error {
-	log.V(2).M(chit).F().P()
-	chop.Config().DeleteCHITemplate((*chi.ClickHouseInstallation)(chit))
-	return nil
 }
 
 // addChopConfig
-func (c *Controller) addChopConfig(chopConfig *chi.ClickHouseOperatorConfiguration) error {
+func (c *Controller) addChopConfig(chopConfig *api.ClickHouseOperatorConfiguration) error {
 	if chop.Get().ConfigManager.IsConfigListed(chopConfig) {
 		log.V(1).M(chopConfig).F().Info("already known config - do nothing")
 	} else {
@@ -598,14 +662,14 @@ func (c *Controller) addChopConfig(chopConfig *chi.ClickHouseOperatorConfigurati
 }
 
 // updateChopConfig
-func (c *Controller) updateChopConfig(old, new *chi.ClickHouseOperatorConfiguration) error {
-	if old.ObjectMeta.ResourceVersion == new.ObjectMeta.ResourceVersion {
-		log.V(2).M(old).F().Info("ResourceVersion did not change: %s", old.ObjectMeta.ResourceVersion)
+func (c *Controller) updateChopConfig(old, new *api.ClickHouseOperatorConfiguration) error {
+	if old.GetObjectMeta().GetResourceVersion() == new.GetObjectMeta().GetResourceVersion() {
+		log.V(2).M(old).F().Info("ResourceVersion did not change: %s", old.GetObjectMeta().GetResourceVersion())
 		// No need to react
 		return nil
 	}
 
-	log.V(2).M(new).F().Info("ResourceVersion change: %s to %s", old.ObjectMeta.ResourceVersion, new.ObjectMeta.ResourceVersion)
+	log.V(2).M(new).F().Info("ResourceVersion change: %s to %s", old.GetObjectMeta().GetResourceVersion(), new.GetObjectMeta().GetResourceVersion())
 	// TODO
 	// NEED REFACTORING
 	//os.Exit(0)
@@ -614,7 +678,7 @@ func (c *Controller) updateChopConfig(old, new *chi.ClickHouseOperatorConfigurat
 }
 
 // deleteChit deletes CHIT
-func (c *Controller) deleteChopConfig(chopConfig *chi.ClickHouseOperatorConfiguration) error {
+func (c *Controller) deleteChopConfig(chopConfig *api.ClickHouseOperatorConfiguration) error {
 	log.V(2).M(chopConfig).F().P()
 	// TODO
 	// NEED REFACTORING
@@ -623,48 +687,45 @@ func (c *Controller) deleteChopConfig(chopConfig *chi.ClickHouseOperatorConfigur
 	return nil
 }
 
-// updateCHIObject updates ClickHouseInstallation object
-func (c *Controller) updateCHIObject(ctx context.Context, chi *chi.ClickHouseInstallation) error {
+type patchFinalizers struct {
+	Op    string   `json:"op"`
+	Path  string   `json:"path"`
+	Value []string `json:"value"`
+}
+
+// patchCHIFinalizers patch ClickHouseInstallation finalizers
+func (c *Controller) patchCHIFinalizers(ctx context.Context, chi *api.ClickHouseInstallation) error {
 	if util.IsContextDone(ctx) {
-		log.V(2).Info("ctx is done")
+		log.V(2).Info("task is done")
 		return nil
 	}
 
+	// TODO fix this with verbosity update
 	// Start Debug object
-	js, err := json.MarshalIndent(chi, "", "  ")
-	if err != nil {
-		log.V(1).M(chi).A().Error("%q", err)
-	}
-	log.V(3).M(chi).F().Info("\n%s\n", js)
+	//js, err := json.MarshalIndent(chi, "", "  ")
+	//if err != nil {
+	//	log.V(1).M(chi).F().Error("%q", err)
+	//}
+	//log.V(3).M(chi).F().Info("\n%s\n", js)
 	// End Debug object
 
-	//if len(chi.Spec.Configuration.Clusters) > 0 {
-	//	if chi.Spec.Configuration.Clusters[0].Address.Namespace != "" ||
-	//		chi.Spec.Configuration.Clusters[0].Address.CHIName != "" ||
-	//		chi.Spec.Configuration.Clusters[0].Address.ClusterName != "" {
-	//		log.V(1).M(chi).A().Error("ERROR update CHI: NON-EMPTY CHI OLD ")
-	//	}
-	//}
+	payload, _ := json.Marshal([]patchFinalizers{{
+		Op:    "replace",
+		Path:  "/metadata/finalizers",
+		Value: chi.GetFinalizers(),
+	}})
 
-	_new, err := c.chopClient.ClickhouseV1().ClickHouseInstallations(chi.Namespace).Update(ctx, chi, newUpdateOptions())
+	_new, err := c.chopClient.ClickhouseV1().ClickHouseInstallations(chi.Namespace).Patch(ctx, chi.Name, kubeTypes.JSONPatchType, payload, controller.NewPatchOptions())
 	if err != nil {
 		// Error update
-		log.V(1).M(chi).A().Error("%q", err)
+		log.V(1).M(chi).F().Error("%q", err)
 		return err
 	}
 
-	//if len(_new.Spec.Configuration.Clusters) > 0 {
-	//	if _new.Spec.Configuration.Clusters[0].Address.Namespace != "" ||
-	//		_new.Spec.Configuration.Clusters[0].Address.CHIName != "" ||
-	//		_new.Spec.Configuration.Clusters[0].Address.ClusterName != "" {
-	//		log.V(1).M(chi).A().Error("ERROR update CHI: NON-EMPTY CHI NEW ")
-	//	}
-	//}
-
-	if chi.ObjectMeta.ResourceVersion != _new.ObjectMeta.ResourceVersion {
+	if chi.GetResourceVersion() != _new.GetResourceVersion() {
 		// Updated
-		log.V(2).M(chi).F().Info("ResourceVersion change: %s to %s", chi.ObjectMeta.ResourceVersion, _new.ObjectMeta.ResourceVersion)
-		chi.ObjectMeta.ResourceVersion = _new.ObjectMeta.ResourceVersion
+		log.V(2).M(chi).F().Info("ResourceVersion change: %s to %s", chi.GetResourceVersion(), _new.GetResourceVersion())
+		chi.SetResourceVersion(_new.GetResourceVersion())
 		return nil
 	}
 
@@ -673,87 +734,79 @@ func (c *Controller) updateCHIObject(ctx context.Context, chi *chi.ClickHouseIns
 	return nil
 }
 
-// updateCHIObjectStatus updates ClickHouseInstallation object's Status
-func (c *Controller) updateCHIObjectStatus(ctx context.Context, chi *chi.ClickHouseInstallation, tolerateAbsence bool) error {
+func (c *Controller) poll(ctx context.Context, chi *api.ClickHouseInstallation, f func(c *api.ClickHouseInstallation, e error) bool) {
 	if util.IsContextDone(ctx) {
-		log.V(2).Info("ctx is done")
-		return nil
+		log.V(2).Info("task is done")
+		return
 	}
 
-	namespace, name := util.NamespaceName(chi.ObjectMeta)
-	log.V(2).M(chi).F().Info("Update CHI status")
+	namespace, name := util.NamespaceName(chi)
 
-	cur, err := c.chopClient.ClickhouseV1().ClickHouseInstallations(namespace).Get(ctx, name, newGetOptions())
-	if err != nil {
-		if tolerateAbsence {
-			return nil
+	for {
+		cur, err := c.kube.CR().Get(ctx, namespace, name)
+		if f(cur.(*api.ClickHouseInstallation), err) {
+			// Continue polling
+			if util.IsContextDone(ctx) {
+				log.V(2).Info("task is done")
+				return
+			}
+			time.Sleep(15 * time.Second)
+		} else {
+			// Stop polling
+			return
 		}
-		log.V(1).M(chi).A().Error("%q", err)
-		return err
 	}
-	if cur == nil {
-		if tolerateAbsence {
-			return nil
-		}
-		log.V(1).M(chi).A().Error("NULL returned")
-		return fmt.Errorf("ERROR GetCHI (%s/%s): NULL returned", namespace, name)
-	}
-
-	// Update status of a real object.
-	// TODO DeepCopy depletes stack here
-	cur.Status = chi.Status
-	return c.updateCHIObject(ctx, cur)
 }
 
 // installFinalizer
-func (c *Controller) installFinalizer(ctx context.Context, chi *chi.ClickHouseInstallation) error {
+func (c *Controller) installFinalizer(ctx context.Context, chi *api.ClickHouseInstallation) error {
 	if util.IsContextDone(ctx) {
-		log.V(2).Info("ctx is done")
+		log.V(2).Info("task is done")
 		return nil
 	}
 
 	log.V(2).M(chi).S().P()
 	defer log.V(2).M(chi).E().P()
 
-	cur, err := c.chopClient.ClickhouseV1().ClickHouseInstallations(chi.Namespace).Get(ctx, chi.Name, newGetOptions())
+	cur, err := c.chopClient.ClickhouseV1().ClickHouseInstallations(chi.Namespace).Get(ctx, chi.Name, controller.NewGetOptions())
 	if err != nil {
 		return err
 	}
 	if cur == nil {
-		return fmt.Errorf("ERROR GetCHI (%s/%s): NULL returned", chi.Namespace, chi.Name)
+		return fmt.Errorf("ERROR GetCR (%s/%s): NULL returned", chi.Namespace, chi.Name)
 	}
 
-	if util.InArray(FinalizerName, cur.ObjectMeta.Finalizers) {
+	if util.InArray(FinalizerName, cur.GetFinalizers()) {
 		// Already installed
 		return nil
 	}
 	log.V(3).M(chi).F().Info("no finalizer found, need to install one")
 
-	cur.ObjectMeta.Finalizers = append(cur.ObjectMeta.Finalizers, FinalizerName)
-	return c.updateCHIObject(ctx, cur)
+	cur.SetFinalizers(append(cur.GetFinalizers(), FinalizerName))
+	return c.patchCHIFinalizers(ctx, cur)
 }
 
 // uninstallFinalizer
-func (c *Controller) uninstallFinalizer(ctx context.Context, chi *chi.ClickHouseInstallation) error {
+func (c *Controller) uninstallFinalizer(ctx context.Context, chi *api.ClickHouseInstallation) error {
 	if util.IsContextDone(ctx) {
-		log.V(2).Info("ctx is done")
+		log.V(2).Info("task is done")
 		return nil
 	}
 
 	log.V(2).M(chi).S().P()
 	defer log.V(2).M(chi).E().P()
 
-	cur, err := c.chopClient.ClickhouseV1().ClickHouseInstallations(chi.Namespace).Get(ctx, chi.Name, newGetOptions())
+	cur, err := c.chopClient.ClickhouseV1().ClickHouseInstallations(chi.Namespace).Get(ctx, chi.Name, controller.NewGetOptions())
 	if err != nil {
 		return err
 	}
 	if cur == nil {
-		return fmt.Errorf("ERROR GetCHI (%s/%s): NULL returned", chi.Namespace, chi.Name)
+		return fmt.Errorf("ERROR GetCR (%s/%s): NULL returned", chi.Namespace, chi.Name)
 	}
 
-	cur.ObjectMeta.Finalizers = util.RemoveFromArray(FinalizerName, cur.ObjectMeta.Finalizers)
+	cur.SetFinalizers(util.RemoveFromArray(FinalizerName, cur.GetFinalizers()))
 
-	return c.updateCHIObject(ctx, cur)
+	return c.patchCHIFinalizers(ctx, cur)
 }
 
 // handleObject enqueues CHI which is owner of `obj` into reconcile loop
@@ -763,12 +816,12 @@ func (c *Controller) handleObject(obj interface{}) {
 	if !ok {
 		ts, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
-			utilruntime.HandleError(fmt.Errorf(messageUnableToDecode))
+			utilRuntime.HandleError(fmt.Errorf(messageUnableToDecode))
 			return
 		}
 		object, ok = ts.Obj.(meta.Object)
 		if !ok {
-			utilruntime.HandleError(fmt.Errorf(messageUnableToDecode))
+			utilRuntime.HandleError(fmt.Errorf(messageUnableToDecode))
 			return
 		}
 	}
@@ -783,7 +836,7 @@ func (c *Controller) handleObject(obj interface{}) {
 	}
 
 	// Ensure owner is of a proper kind
-	if ownerRef.Kind != chi.ClickHouseInstallationCRDResourceKind {
+	if ownerRef.Kind != api.ClickHouseInstallationCRDResourceKind {
 		return
 	}
 
@@ -802,13 +855,16 @@ func (c *Controller) handleObject(obj interface{}) {
 	// TODO c.enqueueObject(chi.Namespace, chi.Name, chi)
 }
 
-// waitForCacheSync is a logger-wrapper over cache.WaitForCacheSync() and it waits for caches to populate
-func waitForCacheSync(ctx context.Context, name string, cacheSyncs ...cache.InformerSynced) bool {
-	log.V(1).F().Info("Syncing caches for %s controller", name)
-	if !cache.WaitForCacheSync(ctx.Done(), cacheSyncs...) {
-		utilruntime.HandleError(fmt.Errorf(messageUnableToSync, name))
+func shouldEnqueue(chi *api.ClickHouseInstallation) bool {
+	if !chop.Config().IsWatchedNamespace(chi.Namespace) {
 		return false
 	}
-	log.V(1).F().Info("Caches are synced for %s controller", name)
+
+	// if CR is suspended, should skip reconciliation
+	if chi.Spec.Suspend.Value() {
+		log.V(5).M(chi).Info("chiInformer: skip enqueue, CHI suspended")
+		return false
+	}
+
 	return true
 }

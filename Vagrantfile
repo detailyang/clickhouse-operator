@@ -18,7 +18,7 @@ end
 
 
 Vagrant.configure(2) do |config|
-  config.vm.box = "generic/ubuntu2004"
+  config.vm.box = "generic/ubuntu2404"
   config.vm.box_check_update = false
 
   if get_provider == "hyperv"
@@ -28,7 +28,7 @@ Vagrant.configure(2) do |config|
   end
 
   if Vagrant.has_plugin?("vagrant-vbguest")
-    config.vbguest.auto_update = false
+    config.vbguest.auto_update = true
   end
 
   if Vagrant.has_plugin?("vagrant-timezone")
@@ -72,6 +72,13 @@ Vagrant.configure(2) do |config|
     # alertmanager
     clickhouse_operator.vm.network "forwarded_port", guest_ip: "172.16.2.99", guest: 9093, host_ip: "127.0.0.1", host: 9093
 
+    # devspace UI
+    clickhouse_operator.vm.network "forwarded_port", guest_ip: "172.16.2.99", guest: 8090, host_ip: "127.0.0.1", host: 8090
+
+    # delve for devspace
+    clickhouse_operator.vm.network "forwarded_port", guest_ip: "172.16.2.99", guest: 40001, host_ip: "127.0.0.1", host: 40001
+    clickhouse_operator.vm.network "forwarded_port", guest_ip: "172.16.2.99", guest: 40002, host_ip: "127.0.0.1", host: 40002
+
     clickhouse_operator.vm.host_name = "local-altinity-clickhouse-operator"
     # vagrant plugin install vagrant-disksize
     clickhouse_operator.disksize.size = '50GB'
@@ -104,7 +111,7 @@ Vagrant.configure(2) do |config|
     apt-get install --no-install-recommends -y clickhouse-client
 
     # golang
-    export GOLANG_VERSION=1.16
+    export GOLANG_VERSION=1.23
     apt-key adv --keyserver keyserver.ubuntu.com --recv-keys F6BC817356A3D45E
     add-apt-repository ppa:longsleep/golang-backports
     apt-get install --no-install-recommends -y golang-${GOLANG_VERSION}-go
@@ -133,14 +140,16 @@ Vagrant.configure(2) do |config|
     tar --verbose -zxvf /usr/local/bin/k9s_${K9S_VERSION}_Linux_x86_64.tar.gz -C /usr/local/bin k9s
 
     # audit2rbac
-    AUDIT2RBAC_VERSION=0.8.0
+    AUDIT2RBAC_VERSION=0.9.0
     curl -sL https://github.com/liggitt/audit2rbac/releases/download/v${AUDIT2RBAC_VERSION}/audit2rbac-linux-amd64.tar.gz | tar -zxvf - -C /usr/local/bin
 
     # minikube
     # MINIKUBE_VERSION=1.18.1
     # MINIKUBE_VERSION=1.19.0
     # MINIKUBE_VERSION=1.20.0
-    MINIKUBE_VERSION=1.22.0
+    # MINIKUBE_VERSION=1.23.2
+    # MINIKUBE_VERSION=1.28.0
+    MINIKUBE_VERSION=1.34.0
     wget -c --progress=bar:force:noscroll -O /usr/local/bin/minikube https://github.com/kubernetes/minikube/releases/download/v${MINIKUBE_VERSION}/minikube-linux-amd64
     chmod +x /usr/local/bin/minikube
     # required for k8s 1.18+
@@ -155,9 +164,13 @@ Vagrant.configure(2) do |config|
 #    K8S_VERSION=${K8S_VERSION:-1.19.14}
 #    performance issue 1.20.x, 1.21.x
 #    https://github.com/kubernetes/kubeadm/issues/2395
-#    K8S_VERSION=${K8S_VERSION:-1.20.10}
-#    K8S_VERSION=${K8S_VERSION:-1.21.4}
-    K8S_VERSION=${K8S_VERSION:-1.22.1}
+#    K8S_VERSION=${K8S_VERSION:-1.20.14}
+#    K8S_VERSION=${K8S_VERSION:-1.21.8}
+#    K8S_VERSION=${K8S_VERSION:-1.22.5}
+#    K8S_VERSION=${K8S_VERSION:-1.23.1}
+#    K8S_VERSION=${K8S_VERSION:-1.24.8}
+#    K8S_VERSION=${K8S_VERSION:-1.25.4}
+    K8S_VERSION=${K8S_VERSION:-1.31.1}
     export VALIDATE_YAML=true
 
     killall kubectl || true
@@ -211,6 +224,8 @@ EOF
     # kubectl krew install debug
     chown -R vagrant:vagrant /home/vagrant/.krew
 
+    export NO_WAIT=1
+
     cd /vagrant/
 
     git_branch=$(git rev-parse --abbrev-ref HEAD)
@@ -220,12 +235,32 @@ EOF
     export OPERATOR_IMAGE=altinity/clickhouse-operator:${OPERATOR_RELEASE}
     export METRICS_EXPORTER_IMAGE=altinity/metrics-exporter:${OPERATOR_RELEASE}
 
+    # devspace
+    DEVSPACE_VERSION=$(curl -sL https://github.com/devspace-cloud/devspace/releases/latest -H "Accept: application/json" | jq -r .tag_name)
+    wget -c --progress=bar:force:noscroll -O /usr/local/bin/${DEVSPACE_VERSION}-devspace-linux-amd64 "https://github.com/devspace-cloud/devspace/releases/download/${DEVSPACE_VERSION}/devspace-linux-amd64"
+    wget -c --progress=bar:force:noscroll -O /usr/local/bin/${DEVSPACE_VERSION}-devspace-linux-amd64.sha256 "https://github.com/devspace-cloud/devspace/releases/download/${DEVSPACE_VERSION}/devspace-linux-amd64.sha256"
+    sed -i -E "s/\\/Users.+devspace\\-linux\\-amd64/\\/usr\\/local\\/bin\\/${DEVSPACE_VERSION}-devspace-linux-amd64/g" /usr/local/bin/${DEVSPACE_VERSION}-devspace-linux-amd64.sha256
+    sha256sum -c /usr/local/bin/${DEVSPACE_VERSION}-devspace-linux-amd64.sha256
+    cp -fv /usr/local/bin/${DEVSPACE_VERSION}-devspace-linux-amd64 /usr/local/bin/devspace
+    chmod +x /usr/local/bin/devspace
+
+    # docker build
+    export COMPANY_REPO=${COMPANY_REPO:-altinity}
+    go mod download -x
+    go mod tidy
+    go mod vendor
+    time docker buildx build -f dockerfile/operator/Dockerfile --platform=linux/amd64 --output=type=image,name=$COMPANY_REPO/clickhouse-operator:$OPERATOR_RELEASE .
+    time docker buildx build -f dockerfile/metrics-exporter/Dockerfile --platform=linux/amd64 --output=type=image,name=$COMPANY_REPO/metrics-exporter:$OPERATOR_RELEASE .
+
+
+    # install clickhouse-operator
     if ! kubectl get deployment clickhouse-operator -n "${OPERATOR_NAMESPACE}" 1>/dev/null 2>/dev/null; then
         cd /vagrant/deploy/operator/
         bash -x ./clickhouse-operator-install.sh
         cd /vagrant
     fi
 
+    # install prometheus-operator + prometheus instance + ServiceMonitor for clickhouse
     export PROMETHEUS_NAMESPACE=${PROMETHEUS_NAMESPACE:-prometheus}
     cd /vagrant/deploy/prometheus/
     kubectl delete ns ${PROMETHEUS_NAMESPACE} || true
@@ -243,6 +278,7 @@ EOF
 
     cd /vagrant/
 
+    # install grafana-operator + grafana instance + GrafanaDashboard, GrafanaDatasource for clickhouse
     export GRAFANA_NAMESPACE=${GRAFANA_NAMESPACE:-grafana}
     cd /vagrant/deploy/grafana/grafana-with-grafana-operator/
     kubectl delete ns ${GRAFANA_NAMESPACE} || true
@@ -269,18 +305,13 @@ EOF
     # open http://localhost:8888/chi and check exists clickhouse installations
     kubectl --namespace="${OPERATOR_NAMESPACE}" port-forward --address 0.0.0.0 service/clickhouse-operator-metrics 8888 </dev/null &>/dev/null &
 
-    for image in $(cat ./tests/configs/test-017-multi-version.yaml | yq r - "spec.templates.podTemplates[*].spec.containers[*].image"); do
+    for image in $(cat ./tests/configs/test-017-multi-version.yaml | yq eval -e ".spec.templates.podTemplates[].spec.containers[].image"); do
         docker pull ${image}
     done
 
-    pip3 install -r /vagrant/tests/requirements.txt
+    pip3 install -r /vagrant/tests/image/requirements.txt
 
-    python3 /vagrant/tests/test_metrics_alerts.py
-    python3 /vagrant/tests/test_zookeeper.py
-    python3 /vagrant/tests/test_backup_alerts.py
-    python3 /vagrant/tests/test_examples.py
-    python3 /vagrant/tests/test_metrics_exporter.py
-    python3 /vagrant/tests/test.py
+    python3 /vagrant/tests/regression.py --native
 
     # audit2rbac
     kubectl logs kube-apiserver-minikube -n kube-system | grep audit.k8s.io/v1 > /tmp/audit2rbac.log
@@ -288,5 +319,4 @@ EOF
     # cp -fv /tmp/audit2rbac.yaml /vagrant/deploy/dev/clickhouse-operator-install-yaml-template-02-section-rbac-restricted.yaml
 
   SHELL
-
 end

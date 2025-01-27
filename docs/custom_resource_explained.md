@@ -117,6 +117,8 @@ expands into
         </test>
      </users>
 ```
+when you skip user/password, or setup it as empty value then `chConfigUserDefaultPassword` parameter value from `etc-clickhouse-operator-files` ConfigMap will use. 
+
 ## .spec.configuration.settings
 ```yaml
     settings:
@@ -438,42 +440,49 @@ Another example with selectively described replicas. Note - `replicasCount` spec
   templates:
     serviceTemplates:
       - name: chi-service-template
-        # generateName understands different sets of macroses,
+        # generateName understands different sets of macros,
         # depending on the level of the object, for which Service is being created:
-        #
-        # For CHI-level Service:
-        # 1. {chi} - ClickHouseInstallation name
-        # 2. {chiID} - short hashed ClickHouseInstallation name (BEWARE, this is an experimental feature)
+        # For CHI/CHK-level Service:
+        # {chi} - ClickHouseInstallation name
+        # {chk} - ClickHouseKeeperInstallation name
+        # {chiID} - short hashed ClickHouseInstallation name 
+        # {chkID} - short hashed ClickHouseKeeperInstallation name
         #
         # For Cluster-level Service:
-        # 1. {chi} - ClickHouseInstallation name
-        # 2. {chiID} - short hashed ClickHouseInstallation name (BEWARE, this is an experimental feature)
-        # 3. {cluster} - cluster name
-        # 4. {clusterID} - short hashed cluster name (BEWARE, this is an experimental feature)
-        # 5. {clusterIndex} - 0-based index of the cluster in the CHI (BEWARE, this is an experimental feature)
+        # {chi} - ClickHouseInstallation name
+        # {chk} - ClickHouseKeeperInstallation name
+        # {chiID} - short hashed ClickHouseInstallation name
+        # {chkID} - short hashed ClickHouseKeeperInstallation name
+        # {cluster} - cluster name
+        # {clusterID} - short hashed cluster name (BEWARE, this is an experimental feature)
+        # {clusterIndex} - 0-based index of the cluster in the CHI (BEWARE, this is an experimental feature)
         #
         # For Shard-level Service:
-        # 1. {chi} - ClickHouseInstallation name
-        # 2. {chiID} - short hashed ClickHouseInstallation name (BEWARE, this is an experimental feature)
-        # 3. {cluster} - cluster name
-        # 4. {clusterID} - short hashed cluster name (BEWARE, this is an experimental feature)
-        # 5. {clusterIndex} - 0-based index of the cluster in the CHI (BEWARE, this is an experimental feature)
-        # 6. {shard} - shard name
-        # 7. {shardID} - short hashed shard name (BEWARE, this is an experimental feature)
-        # 8. {shardIndex} - 0-based index of the shard in the cluster (BEWARE, this is an experimental feature)
+        # {chi} - ClickHouseInstallation name
+        # {chk} - ClickHouseKeeperInstallation name
+        # {chiID} - short hashed ClickHouseInstallation name
+        # {chkID} - short hashed ClickHouseKeeperInstallation name
+        # {cluster} - cluster name
+        # {clusterID} - short hashed cluster name (BEWARE, this is an experimental feature)
+        # {clusterIndex} - 0-based index of the cluster in the CHI
+        # {shard} - shard name
+        # {shardID} - short hashed shard name (BEWARE, this is an experimental feature)
+        # {shardIndex} - 0-based index of the shard in the cluster 
         #
         # For Replica-level Service:
-        # 1. {chi} - ClickHouseInstallation name
-        # 2. {chiID} - short hashed ClickHouseInstallation name (BEWARE, this is an experimental feature)
-        # 3. {cluster} - cluster name
-        # 4. {clusterID} - short hashed cluster name (BEWARE, this is an experimental feature)
-        # 5. {clusterIndex} - 0-based index of the cluster in the CHI (BEWARE, this is an experimental feature)
-        # 6. {shard} - shard name
-        # 7. {shardID} - short hashed shard name (BEWARE, this is an experimental feature)
-        # 8. {shardIndex} - 0-based index of the shard in the cluster (BEWARE, this is an experimental feature)
-        # 9. {replica} - replica name
-        # 10. {replicaID} - short hashed replica name (BEWARE, this is an experimental feature)
-        # 11. {replicaIndex} - 0-based index of the replica in the shard (BEWARE, this is an experimental feature)
+        # {chi} - ClickHouseInstallation name
+        # {chk} - ClickHouseKeeperInstallation name
+        # {chiID} - short hashed ClickHouseInstallation name
+        # {chkID} - short hashed ClickHouseKeeperInstallation name
+        # {cluster} - cluster name
+        # {clusterID} - short hashed cluster name 
+        # {clusterIndex} - 0-based index of the cluster in the CHI 
+        # {shard} - shard name
+        # {shardID} - short hashed shard name (BEWARE, this is an experimental feature)
+        # {shardIndex} - 0-based index of the shard in the cluster 
+        # {replica} - replica name
+        # {replicaID} - short hashed replica name 
+        # {replicaIndex} - 0-based index of the replica in the shard 
         generateName: "service-{chi}"
         # type ObjectMeta struct from k8s.io/meta/v1
         metadata:
@@ -559,7 +568,7 @@ with additional sections, such as:
         spec:
           containers:
             - name: clickhouse
-              image: yandex/clickhouse-server:18.16.1
+              image: clickhouse/clickhouse-server:23.8
               volumeMounts:
                 - name: default-volume-claim
                   mountPath: /var/lib/clickhouse

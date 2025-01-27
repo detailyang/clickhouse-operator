@@ -6,9 +6,12 @@ echo "External value for \$GRAFANA_ADMIN_USER=$GRAFANA_ADMIN_USER"
 echo "External value for \$GRAFANA_ADMIN_PASSWORD=$GRAFANA_ADMIN_PASSWORD"
 echo "External value for \$GRAFANA_DISABLE_LOGIN_FORM=$GRAFANA_DISABLE_LOGIN_FORM"
 echo "External value for \$GRAFANA_DISABLE_SIGNOUT_MENU=$GRAFANA_DISABLE_SIGNOUT_MENU"
+echo "External value for \$GRAFANA_GRAFANA_ANONYMOUS_EDITOR=$GRAFANA_ANONYMOUS_EDITOR"
 echo "External value for \$GRAFANA_OPERATOR_DASHBOARD_NAME=$GRAFANA_OPERATOR_DASHBOARD_NAME"
 echo "External value for \$GRAFANA_QUERIES_DASHBOARD_NAME=$GRAFANA_QUERIES_DASHBOARD_NAME"
 echo "External value for \$GRAFANA_ZOOKEEPER_DASHBOARD_NAME=$GRAFANA_ZOOKEEPER_DASHBOARD_NAME"
+echo "External value for \$GRAFANA_CLICKHOUSE_KEEPER_DASHBOARD_NAME=$GRAFANA_CLICKHOUSE_KEEPER_DASHBOARD_NAME"
+echo "External value for \$GRAFANA_CLICKHOUSE_KAFKA_DASHBOARD_NAME=$GRAFANA_CLICKHOUSE_KAFKA_DASHBOARD_NAME"
 echo "External value for \$GRAFANA_PROMETHEUS_DATASOURCE_NAME=$GRAFANA_PROMETHEUS_DATASOURCE_NAME"
 echo "External value for \$PROMETHEUS_URL=$PROMETHEUS_URL"
 echo "External value for \$GRAFANA_ROOT_URL=$GRAFANA_ROOT_URL"
@@ -22,11 +25,14 @@ GRAFANA_ADMIN_USER="${GRAFANA_ADMIN_USER:-admin}"
 GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-admin}"
 GRAFANA_DISABLE_LOGIN_FORM="${GRAFANA_DISABLE_LOGIN_FORM:-False}"
 GRAFANA_DISABLE_SIGNOUT_MENU="${GRAFANA_DISABLE_SIGNOUT_MENU:-False}"
+GRAFANA_ANONYMOUS_EDITOR="${GRAFANA_ANONYMOUS_EDITOR:-True}"
 
 GRAFANA_OPERATOR_DASHBOARD_NAME="${GRAFANA_OPERATOR_DASHBOARD_NAME:-clickhouse-operator-dashboard}"
 GRAFANA_QUERIES_DASHBOARD_NAME=${GRAFANA_QUERIES_DASHBOARD_NAME:-clickhouse-queries-dashboard}
 GRAFANA_QUERIES_DASHBOARD_NAME=${GRAFANA_QUERIES_DASHBOARD_NAME:-clickhouse-queries-dashboard}
 GRAFANA_ZOOKEEPER_DASHBOARD_NAME=${GRAFANA_ZOOKEEPER_DASHBOARD_NAME:-zookeeper-dashboard}
+GRAFANA_CLICKHOUSE_KEEPER_DASHBOARD_NAME=${GRAFANA_CLICKHOUSE_KEEPER_DASHBOARD_NAME:-clickhouse-keeper-dashboard}
+GRAFANA_CLICKHOUSE_KAFKA_DASHBOARD_NAME=${GRAFANA_CLICKHOUSE_KAFKA_DASHBOARD_NAME:-clickhouse-kafka-dashboard}
 
 GRAFANA_PROMETHEUS_DATASOURCE_NAME="${GRAFANA_PROMETHEUS_DATASOURCE_NAME:-clickhouse-operator-prometheus}"
 PROMETHEUS_URL="${PROMETHEUS_URL:-http://prometheus.prometheus:9090}"
@@ -42,15 +48,20 @@ echo "\$GRAFANA_ADMIN_USER=$GRAFANA_ADMIN_USER"
 echo "\$GRAFANA_ADMIN_PASSWORD=$GRAFANA_ADMIN_PASSWORD"
 echo "\$GRAFANA_DISABLE_LOGIN_FORM=$GRAFANA_DISABLE_LOGIN_FORM"
 echo "\$GRAFANA_DISABLE_SIGNOUT_MENU=$GRAFANA_DISABLE_SIGNOUT_MENU"
+echo "\$GRAFANA_ANONYMOUS_EDITOR=$GRAFANA_ANONYMOUS_EDITOR"
 echo "\$GRAFANA_OPERATOR_DASHBOARD_NAME=$GRAFANA_OPERATOR_DASHBOARD_NAME"
 echo "\$GRAFANA_QUERIES_DASHBOARD_NAME=$GRAFANA_QUERIES_DASHBOARD_NAME"
+echo "\$GRAFANA_ZOOKEEPER_DASHBOARD_NAME=$GRAFANA_ZOOKEEPER_DASHBOARD_NAME"
+echo "\$GRAFANA_CLICKHOUSE_KEEPER_DASHBOARD_NAME=$GRAFANA_CLICKHOUSE_KEEPER_DASHBOARD_NAME"
 echo "\$GRAFANA_PROMETHEUS_DATASOURCE_NAME=$GRAFANA_PROMETHEUS_DATASOURCE_NAME"
 echo "\$PROMETHEUS_URL=$PROMETHEUS_URL"
 echo "\$GRAFANA_ROOT_URL=$GRAFANA_ROOT_URL"
 echo ""
 echo "!!! IMPORTANT !!!"
 echo "If you do not agree with specified options, press ctrl-c now"
-sleep 10
+if [[ "" == "${NO_WAIT}" ]]; then
+  sleep 10
+fi
 echo "Apply options now..."
 
 ###########################
@@ -100,7 +111,8 @@ function wait_grafana_datasource_to_start() {
     local datasource=$2
 
     echo -n "Waiting for Grafana DataSource custom resource '${namespace}/${datasource}'"
-    while [[ $(kubectl --namespace="${namespace}" get grafanadatasources "${datasource}" -o'=custom-columns=NAME:.metadata.name,STATUS:.status.message' | grep -i "success" | wc -l) == "0" ]]; do
+    # while [[ $(kubectl --namespace="${namespace}" get grafanadatasources "${datasource}" -o'=custom-columns=NAME:.metadata.name,STATUS:.status.message' | grep -i "success" | wc -l) == "0" ]]; do
+    while [[ $(kubectl --namespace="${namespace}" get grafanadatasources "${datasource}" -o'=custom-columns=NAME:.metadata.name,STATUS:.status.message' | wc -l) == "0" ]]; do
         printf "."
         sleep 1
     done
@@ -125,6 +137,7 @@ kubectl --namespace="${GRAFANA_NAMESPACE}" apply -f <( \
     GRAFANA_ADMIN_PASSWORD="$GRAFANA_ADMIN_PASSWORD" \
     GRAFANA_DISABLE_LOGIN_FORM="$GRAFANA_DISABLE_LOGIN_FORM" \
     GRAFANA_DISABLE_SIGNOUT_MENU="$GRAFANA_DISABLE_SIGNOUT_MENU" \
+    GRAFANA_ANONYMOUS_EDITOR="$GRAFANA_ANONYMOUS_EDITOR" \
     OAUTH_CLIENT_ID="$OAUTH_CLIENT_ID" \
     OAUTH_CLIENT_SECRET="$OAUTH_CLIENT_SECRET" \
     OAUTH_DOMAIN="$OAUTH_DOMAIN" \
@@ -162,12 +175,13 @@ wait_grafana_to_start "${GRAFANA_NAMESPACE}" "${GRAFANA_NAME}"
 # Install CLickHouse DataSource(s)
 
 # TODO get clickhouse password from Vault-k8s secrets ?
-# more precise but required yq
-# OPERATOR_CH_USER=$(yq r ${CUR_DIR}/../../../config/config.yaml chUsername)
-# OPERATOR_CH_PASS=$(yq r ${CUR_DIR}/../../../config/config.yaml chPassword)
-
-OPERATOR_CH_USER=$(grep chUsername ${CUR_DIR}/../../../config/config.yaml | cut -d " " -f 2-)
-OPERATOR_CH_PASS=$(grep chPassword ${CUR_DIR}/../../../config/config.yaml | cut -d " " -f 2-)
+if ! command -v yq &> /dev/null; then
+  echo "Install 'yq', see installation instruction in https://github.com/mikefarah/yq/#install"
+  exit 1
+else
+  export OPERATOR_CH_USER=$(yq 'select(.kind == "Secret") | .stringData.username' "${CUR_DIR}/../../operator/clickhouse-operator-install-bundle.yaml")
+  export OPERATOR_CH_PASS=$(yq 'select(.kind == "Secret") | .stringData.password' "${CUR_DIR}/../../operator/clickhouse-operator-install-bundle.yaml")
+fi
 
 echo "Create ClickHouse DataSource for each ClickHouseInstallation"
 IFS=$'\n'
@@ -184,6 +198,23 @@ for LINE in $(kubectl get --all-namespaces chi -o custom-columns=NAMESPACE:.meta
         kubectl --namespace="${NAMESPACE}" exec "${POD}" -- \
             clickhouse-client --echo -mn -q 'SELECT hostName(), dummy FROM system.one SETTINGS log_queries=1; SYSTEM FLUSH LOGS'
     done
+
+    echo "Ensure clickhouse-operator will connect to any chi from grafana"
+    POD_NETWORK_CIDR=$(kubectl get cm -n kube-system kube-proxy -o yaml | grep clusterCIDR | cut -d ":" -f 2)
+    kubectl apply --validate=${VALIDATE_YAML} --namespace="${NAMESPACE}" -f <(
+      {
+        echo "apiVersion: clickhouse.altinity.com/v1"
+        echo "kind: ClickHouseInstallationTemplate"
+        echo "metadata:"
+        echo " name: clickhouse-operator-from-cluster-network"
+        echo "spec:"
+        echo "  templating:"
+        echo "    policy: auto"
+        echo "  configuration:"
+        echo "    users:"
+        echo "      ${OPERATOR_CH_USER}/networks/ip: ${POD_NETWORK_CIDR}"
+      }
+    )
 
     GRAFANA_CLICKHOUSE_DATASOURCE_NAME="k8s-${NAMESPACE}-${CHI}"
     CLICKHOUSE_URL="http://${ENDPOINT}:${PORT}"
@@ -215,6 +246,22 @@ kubectl apply --validate=${VALIDATE_YAML} --namespace="${GRAFANA_NAMESPACE}" -f 
     GRAFANA_ZOOKEEPER_DASHBOARD_NAME="$GRAFANA_ZOOKEEPER_DASHBOARD_NAME" \
     GRAFANA_PROMETHEUS_DATASOURCE_NAME="$GRAFANA_PROMETHEUS_DATASOURCE_NAME" \
     envsubst \
+)
+
+echo "Install ClickHouse Keeper dashboard"
+kubectl apply --validate=${VALIDATE_YAML} --namespace="${GRAFANA_NAMESPACE}" -f <( \
+    cat ${CUR_DIR}/grafana-dashboard-clickhouse-keeper-cr-template.yaml | \
+    GRAFANA_CLICKHOUSE_KEEPER_DASHBOARD_NAME="$GRAFANA_CLICKHOUSE_KEEPER_DASHBOARD_NAME" \
+    GRAFANA_PROMETHEUS_DATASOURCE_NAME="$GRAFANA_PROMETHEUS_DATASOURCE_NAME" \
+    envsubst '$GRAFANA_CLICKHOUSE_KEEPER_DASHBOARD_NAME $GRAFANA_PROMETHEUS_DATASOURCE_NAME' \
+)
+
+echo "Install ClickHouse Kafka dashboard"
+kubectl apply --validate=${VALIDATE_YAML} --namespace="${GRAFANA_NAMESPACE}" -f <( \
+    cat ${CUR_DIR}/grafana-dashboard-kafka-cr-template.yaml | \
+    GRAFANA_CLICKHOUSE_KAFKA_DASHBOARD_NAME="$GRAFANA_CLICKHOUSE_KAFKA_DASHBOARD_NAME" \
+    GRAFANA_PROMETHEUS_DATASOURCE_NAME="$GRAFANA_PROMETHEUS_DATASOURCE_NAME" \
+    envsubst '$GRAFANA_CLICKHOUSE_KAFKA_DASHBOARD_NAME $GRAFANA_PROMETHEUS_DATASOURCE_NAME' \
 )
 
 wait_grafana_plugin_ch_datasource_to_start "${GRAFANA_NAMESPACE}"

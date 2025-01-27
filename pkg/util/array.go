@@ -44,15 +44,25 @@ func InArrayWithRegexp(needle string, haystack []string) bool {
 
 // MergeStringArrays appends into dst items from src that are not present in src. src items are being deduplicated
 func MergeStringArrays(dst []string, src []string) []string {
-	for _, str := range src {
-		if !InArray(str, dst) {
-			dst = append(dst, str)
+	for _, item := range src {
+		if !InArray(item, dst) {
+			dst = append(dst, item)
 		}
 	}
 	return dst
 }
 
-// RemoveFromArray removes removed the needle from the haystack
+// IntersectStringArrays intersects arrays `a` and `b`
+func IntersectStringArrays(a []string, b []string) (res []string) {
+	for _, item := range a {
+		if InArray(item, b) {
+			res = append(res, item)
+		}
+	}
+	return res
+}
+
+// RemoveFromArray removes the needle from the haystack
 func RemoveFromArray(needle string, haystack []string) []string {
 	result := []string{}
 
@@ -68,8 +78,8 @@ func RemoveFromArray(needle string, haystack []string) []string {
 
 // Unzip makes two 1-value columns (slices) out of one 2-value column (slice)
 func Unzip(slice [][]string) ([]string, []string) {
-	col1 := make([]string, len(slice))
-	col2 := make([]string, len(slice))
+	col1 := make([]string, 0, len(slice))
+	col2 := make([]string, 0, len(slice))
 	for i := 0; i < len(slice); i++ {
 		col1 = append(col1, slice[i][0])
 		if len(slice[i]) > 1 {
@@ -118,4 +128,52 @@ func Slice2String(name string, slice []string) string {
 	}
 
 	return b.String()
+}
+
+func Prefix(slice []string, prefix string) (res []string) {
+	for _, entry := range slice {
+		res = append(res, prefix+entry)
+	}
+	return res
+}
+
+func Unique(slice []string) (unique []string) {
+	found := make(map[string]bool)
+
+	for _, entry := range slice {
+		found[entry] = true
+	}
+
+	for entry := range found {
+		unique = append(unique, entry)
+	}
+
+	return unique
+}
+
+func NonEmpty(slice []string) (nonEmpty []string) {
+	for _, str := range slice {
+		if str != "" {
+			nonEmpty = append(nonEmpty, str)
+		}
+	}
+	return nonEmpty
+}
+
+func ConcatSlices[T any](slices [][]T) []T {
+	var totalLen int
+
+	for _, s := range slices {
+		totalLen += len(s)
+	}
+
+	result := make([]T, totalLen)
+
+	var i int
+
+	for _, s := range slices {
+		i += copy(result[i:], s)
+	}
+
+	return result
 }

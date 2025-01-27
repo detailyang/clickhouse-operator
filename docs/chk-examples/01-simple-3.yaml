@@ -1,0 +1,10 @@
+apiVersion: "clickhouse-keeper.altinity.com/v1"
+kind: "ClickHouseKeeperInstallation"
+metadata:
+  name: simple-3
+spec:
+  configuration:
+    clusters:
+      - name: "cluster1"
+        layout:
+          replicasCount: 3

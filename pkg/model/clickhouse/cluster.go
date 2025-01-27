@@ -26,7 +26,7 @@ import (
 
 // Cluster specifies clickhouse cluster object
 type Cluster struct {
-	*ClusterEndpointCredentials
+	*ClusterConnectionParams
 	Hosts []string
 	l     log.Announcer
 }
@@ -47,14 +47,14 @@ func (c *Cluster) SetLog(a log.Announcer) *Cluster {
 	return c
 }
 
-// SetEndpointCredentials sets endpoint credentials
-func (c *Cluster) SetEndpointCredentials(endpointCredentials *ClusterEndpointCredentials) *Cluster {
-	if c == nil {
-		return nil
-	}
-	c.ClusterEndpointCredentials = endpointCredentials
-	return c
-}
+// SetCredentials sets endpoint credentials
+//func (c *Cluster) SetCredentials(clusterCredentials *ClusterCredentials) *Cluster {
+//	if c == nil {
+//		return nil
+//	}
+//	c.ClusterCredentials = clusterCredentials
+//	return c
+//}
 
 // SetHosts sets hosts
 func (c *Cluster) SetHosts(hosts []string) *Cluster {
@@ -66,15 +66,15 @@ func (c *Cluster) SetHosts(hosts []string) *Cluster {
 }
 
 // getConnection gets connection
-func (c *Cluster) getConnection(host string) *Connection {
-	return GetPooledDBConnection(NewConnectionParams(host, c.Username, c.Password, c.Port)).SetLog(c.l)
+func (c *Cluster) getHostConnection(host string) *Connection {
+	return GetPooledDBConnection(c.NewEndpointConnectionParams(host)).SetLog(c.l)
 }
 
 // QueryAny walks over all endpoints and runs query sequentially on each of them.
 // In case endpoint returned result, walk is completed and result is returned.
-// In case endpoint failed, continue with next endpoint.
+// In case endpoint failed, continue with the next endpoint.
 func (c *Cluster) QueryAny(ctx context.Context, sql string) (*QueryResult, error) {
-	// Try to fetch data from any of endpoints.
+	// Try to fetch data from any of the endpoints.
 	for _, host := range c.Hosts {
 		if util.IsContextDone(ctx) {
 			c.l.V(2).Info("ctx is done")
@@ -82,17 +82,17 @@ func (c *Cluster) QueryAny(ctx context.Context, sql string) (*QueryResult, error
 		}
 
 		c.l.V(1).Info("Run query on: %s of %v", host, c.Hosts)
-		query, err := c.getConnection(host).QueryContext(ctx, sql)
+		query, err := c.getHostConnection(host).QueryContext(ctx, sql)
 		if err == nil {
 			// Endpoint returned result, no need to iterate more
 			return query, nil
 		}
 		// Still need to iterate more
-		c.l.V(1).A().Warning("FAILED to run query on: %s of %v skip to next. err: %v", host, c.Hosts, err)
+		c.l.V(1).F().Warning("FAILED to run query on: %s of %v skip to next. err: %v", host, c.Hosts, err)
 	}
 
 	str := fmt.Sprintf("FAILED to run query on all hosts %v", c.Hosts)
-	c.l.V(1).A().Error(str)
+	c.l.V(1).F().Error(str)
 	return nil, fmt.Errorf(str)
 }
 
@@ -135,7 +135,7 @@ func (c *Cluster) exec(ctx context.Context, host string, queries []string, _opts
 		c.l.V(2).Info("ctx is done")
 		return nil
 	}
-	conn := c.getConnection(host)
+	conn := c.getHostConnection(host)
 	if conn == nil {
 		c.l.V(1).M(host).F().Warning("Unable to get conn to host %s", host)
 		return nil
@@ -155,13 +155,14 @@ func (c *Cluster) exec(ctx context.Context, host string, queries []string, _opts
 					continue
 				}
 				err := conn.Exec(ctx, sql, opts)
-				if err != nil && strings.Contains(err.Error(), "Code: 253,") && strings.Contains(sql, "CREATE TABLE") {
+				if err != nil && strings.Contains(err.Error(), "Code: 253") && strings.Contains(sql, "CREATE TABLE") {
+					// WARNING: error message or code may change in newer ClickHouse versions
 					c.l.V(1).M(host).F().Info("Replica is already in ZooKeeper. Trying ATTACH TABLE instead")
 					sqlAttach := strings.ReplaceAll(sql, "CREATE TABLE", "ATTACH TABLE")
 					err = conn.Exec(ctx, sqlAttach, opts)
 				}
-				if err == nil {
-					queries[i] = "" // Query is executed, removing from the list
+				if err == nil || strings.Contains(err.Error(), "ALREADY_EXISTS") {
+					queries[i] = "" // Query is executed or object already exists, removing from the list
 				} else {
 					errors = append(errors, err)
 				}

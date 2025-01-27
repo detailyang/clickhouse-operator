@@ -18,6 +18,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/altinity/clickhouse-operator/pkg/metrics/clickhouse"
 	"os"
 	"os/signal"
 	"syscall"
@@ -25,7 +26,6 @@ import (
 	log "github.com/golang/glog"
 	// log "k8s.io/klog"
 
-	"github.com/altinity/clickhouse-operator/pkg/apis/metrics"
 	"github.com/altinity/clickhouse-operator/pkg/chop"
 	"github.com/altinity/clickhouse-operator/pkg/version"
 )
@@ -33,7 +33,7 @@ import (
 // Prometheus exporter defaults
 const (
 	defaultMetricsEndpoint = ":8888"
-	defaultChiListEP       = ":8888"
+	defaultChiListEndPoint = ":8888"
 
 	metricsPath = "/metrics"
 	chiListPath = "/chi"
@@ -65,7 +65,7 @@ func init() {
 	flag.StringVar(&kubeConfigFile, "kubeconfig", "", "Path to custom kubernetes config file. Makes sense if runs outside of the cluster only.")
 	flag.StringVar(&masterURL, "master", "", "The address of custom Kubernetes API server. Makes sense if runs outside of the cluster and not being specified in kube config file only.")
 	flag.StringVar(&metricsEP, "metrics-endpoint", defaultMetricsEndpoint, "The Prometheus exporter endpoint.")
-	flag.StringVar(&chiListEP, "chi-list-endpoint", defaultChiListEP, "The CHI list endpoint.")
+	flag.StringVar(&chiListEP, "chi-list-endpoint", defaultChiListEndPoint, "The CHI list endpoint.")
 	flag.Parse()
 }
 
@@ -90,27 +90,22 @@ func Run() {
 	log.Infof("Starting metrics exporter. Version:%s GitSHA:%s BuiltAt:%s\n", version.Version, version.GitSHA, version.BuiltAt)
 
 	// Initialize k8s API clients
-	kubeClient, chopClient := chop.GetClientset(kubeConfigFile, masterURL)
+	kubeClient, _, chopClient := chop.GetClientset(kubeConfigFile, masterURL)
 
 	// Create operator instance
 	chop.New(kubeClient, chopClient, chopConfigFile)
 	log.Info(chop.Config().String(true))
 
-	exporter := metrics.StartMetricsREST(
-		metrics.NewCHAccessInfo(
-			chop.Config().CHUsername,
-			chop.Config().CHPassword,
-			chop.Config().CHPort,
-		),
-
+	exporter := clickhouse.StartMetricsREST(
 		metricsEP,
 		metricsPath,
+		chop.Config().ClickHouse.Metrics.Timeouts.Collect,
 
 		chiListEP,
 		chiListPath,
 	)
 
-	exporter.DiscoveryWatchedCHIs(chopClient)
+	exporter.DiscoveryWatchedCHIs(kubeClient, chopClient)
 
 	<-ctx.Done()
 }

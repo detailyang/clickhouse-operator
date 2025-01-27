@@ -4,7 +4,7 @@ echo "External value for \$GRAFANA_NAMESPACE=$GRAFANA_NAMESPACE"
 echo "External value for \$GRAFANA_OPERATOR_VERSION=$GRAFANA_OPERATOR_VERSION"
 
 GRAFANA_NAMESPACE="${GRAFANA_NAMESPACE:-grafana}"
-GRAFANA_OPERATOR_VERSION="${GRAFANA_OPERATOR_VERSION:-v3.9.0}"
+GRAFANA_OPERATOR_VERSION="${GRAFANA_OPERATOR_VERSION:-v4.8.0}"
 
 echo "Setup Grafana"
 echo "OPTIONS"
@@ -13,7 +13,9 @@ echo "\$GRAFANA_OPERATOR_VERSION=${GRAFANA_OPERATOR_VERSION}"
 echo ""
 echo "!!! IMPORTANT !!!"
 echo "If you do not agree with specified options, press ctrl-c now"
-sleep 10
+if [[ "" == "${NO_WAIT}" ]]; then
+  sleep 10
+fi
 echo "Apply options now..."
 
 ##
@@ -53,7 +55,7 @@ trap "clean_dir ${TMP_DIR}" SIGHUP SIGINT SIGQUIT SIGFPE SIGALRM SIGTERM
 
 # Continue with sources
 echo "Download Grafana operator sources into ${GRAFANA_OPERATOR_DIR}"
-git clone -b ${GRAFANA_OPERATOR_VERSION} --single-branch "https://github.com/integr8ly/grafana-operator" "${GRAFANA_OPERATOR_DIR}"
+git clone -b ${GRAFANA_OPERATOR_VERSION} --single-branch "https://github.com/grafana-operator/grafana-operator" "${GRAFANA_OPERATOR_DIR}"
 
 
 echo "Setup Grafana operator into ${GRAFANA_NAMESPACE} namespace"
@@ -65,14 +67,16 @@ kubectl create namespace "${GRAFANA_NAMESPACE}" || true
 # Setup grafana-operator into dedicated namespace
 
 # 1. Create the custom resource definitions that the operator uses:
-kubectl --namespace="${GRAFANA_NAMESPACE}" apply -f "${GRAFANA_OPERATOR_DIR}/deploy/crds"
+kubectl --namespace="${GRAFANA_NAMESPACE}" apply -f <(
+ cat "${GRAFANA_OPERATOR_DIR}/deploy/manifests/${GRAFANA_OPERATOR_VERSION}/crds.yaml" | sed "s/namespace: system/namespace: ${GRAFANA_NAMESPACE}/g"
+)
 # 2. Create the operator roles:
-kubectl --namespace="${GRAFANA_NAMESPACE}" apply -f "${GRAFANA_OPERATOR_DIR}/deploy/roles"
-# 3. If you want to scan for dashboards in other namespaces you also need the cluster roles:
-kubectl --namespace="${GRAFANA_NAMESPACE}" apply -f "${GRAFANA_OPERATOR_DIR}/deploy/cluster_roles"
-# 4. Deploy the operator of explicitly specified version
-kubectl --namespace="${GRAFANA_NAMESPACE}" apply -f <( \
-    cat "${GRAFANA_OPERATOR_DIR}/deploy/operatorMasterImage.yaml" | sed -e "s/:master/:${GRAFANA_OPERATOR_VERSION}/g" \
+kubectl --namespace="${GRAFANA_NAMESPACE}" apply -f <(
+  cat "${GRAFANA_OPERATOR_DIR}/deploy/manifests/${GRAFANA_OPERATOR_VERSION}/rbac.yaml" | sed "s/namespace: system/namespace: ${GRAFANA_NAMESPACE}/g" | sed "s/controller-manager/grafana-operator/g"
+)
+# 3. Deploy the operator of explicitly specified version
+kubectl --namespace="${GRAFANA_NAMESPACE}" apply -f <(
+  cat "${GRAFANA_OPERATOR_DIR}/deploy/manifests/${GRAFANA_OPERATOR_VERSION}/deployment.yaml" | sed "s/namespace: system/namespace: ${GRAFANA_NAMESPACE}/g" | sed "s/controller-manager/grafana-operator/g"
 )
 
 # Remove downloaded sources
