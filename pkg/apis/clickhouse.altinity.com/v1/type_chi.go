@@ -16,499 +16,223 @@ package v1
 
 import (
 	"context"
-	"math"
-	"strings"
+	"encoding/json"
+	"fmt"
 
+	"github.com/imdario/mergo"
+	"gopkg.in/yaml.v3"
+
+	"github.com/altinity/clickhouse-operator/pkg/apis/common/types"
 	"github.com/altinity/clickhouse-operator/pkg/util"
-	"github.com/altinity/clickhouse-operator/pkg/version"
 )
 
+func (cr *ClickHouseInstallation) GetSpec() ICRSpec {
+	return &cr.Spec
+}
+
+func (cr *ClickHouseInstallation) GetSpecT() *ChiSpec {
+	return &cr.Spec
+}
+
+func (cr *ClickHouseInstallation) GetSpecA() any {
+	return &cr.Spec
+}
+
+func (cr *ClickHouseInstallation) GetRuntime() ICustomResourceRuntime {
+	return cr.ensureRuntime()
+}
+
+func (cr *ClickHouseInstallation) ensureRuntime() *ClickHouseInstallationRuntime {
+	if cr == nil {
+		return nil
+	}
+
+	// Assume that most of the time, we'll see a non-nil value.
+	if cr.runtime != nil {
+		return cr.runtime
+	}
+
+	// Otherwise, we need to acquire a lock to initialize the field.
+	cr.runtimeCreatorMutex.Lock()
+	defer cr.runtimeCreatorMutex.Unlock()
+	// Note that we have to check this property again to avoid a TOCTOU bug.
+	if cr.runtime == nil {
+		cr.runtime = newClickHouseInstallationRuntime()
+	}
+	return cr.runtime
+}
+
+func (cr *ClickHouseInstallation) IEnsureStatus() IStatus {
+	return any(cr.EnsureStatus()).(IStatus)
+}
+
+// EnsureStatus ensures status
+func (cr *ClickHouseInstallation) EnsureStatus() *Status {
+	if cr == nil {
+		return nil
+	}
+
+	// Assume that most of the time, we'll see a non-nil value.
+	if cr.Status != nil {
+		return cr.Status
+	}
+
+	// Otherwise, we need to acquire a lock to initialize the field.
+	cr.statusCreatorMutex.Lock()
+	defer cr.statusCreatorMutex.Unlock()
+	// Note that we have to check this property again to avoid a TOCTOU bug.
+	if cr.Status == nil {
+		cr.Status = &Status{}
+	}
+	return cr.Status
+}
+
+// GetStatus gets Status
+func (cr *ClickHouseInstallation) GetStatus() IStatus {
+	if cr == nil {
+		return (*Status)(nil)
+	}
+	return cr.Status
+}
+
+// HasStatus checks whether CHI has Status
+func (cr *ClickHouseInstallation) HasStatus() bool {
+	if cr == nil {
+		return false
+	}
+	return cr.Status != nil
+}
+
+// HasAncestor checks whether CR has an ancestor
+func (cr *ClickHouseInstallation) HasAncestor() bool {
+	if !cr.HasStatus() {
+		return false
+	}
+	return cr.Status.HasNormalizedCRCompleted()
+}
+
+// GetAncestor gets ancestor of a CR
+func (cr *ClickHouseInstallation) GetAncestor() ICustomResource {
+	if !cr.HasAncestor() {
+		return (*ClickHouseInstallation)(nil)
+	}
+	return cr.Status.GetNormalizedCRCompleted()
+}
+
+// GetAncestorT gets ancestor of a CR
+func (cr *ClickHouseInstallation) GetAncestorT() *ClickHouseInstallation {
+	if !cr.HasAncestor() {
+		return nil
+	}
+	return cr.Status.GetNormalizedCRCompleted()
+}
+
+// SetAncestor sets ancestor of a CR
+func (cr *ClickHouseInstallation) SetAncestor(a *ClickHouseInstallation) {
+	if cr == nil {
+		return
+	}
+	cr.EnsureStatus().NormalizedCRCompleted = a
+}
+
+// HasTarget checks whether CR has a target
+func (cr *ClickHouseInstallation) HasTarget() bool {
+	if !cr.HasStatus() {
+		return false
+	}
+	return cr.Status.HasNormalizedCR()
+}
+
+// GetTarget gets target of a CR
+func (cr *ClickHouseInstallation) GetTarget() *ClickHouseInstallation {
+	if !cr.HasTarget() {
+		return nil
+	}
+	return cr.Status.GetNormalizedCR()
+}
+
+// SetTarget sets target of a CR
+func (cr *ClickHouseInstallation) SetTarget(a *ClickHouseInstallation) {
+	if cr == nil {
+		return
+	}
+	cr.EnsureStatus().NormalizedCR = a
+}
+
+func (cr *ClickHouseInstallation) GetUsedTemplates() []*TemplateRef {
+	return cr.GetSpecT().UseTemplates
+}
+
 // FillStatus fills .Status
-func (chi *ClickHouseInstallation) FillStatus(endpoint string, pods, fqdns []string, normalized bool) {
-	chi.Status.Version = version.Version
-	chi.Status.ClustersCount = chi.ClustersCount()
-	chi.Status.ShardsCount = chi.ShardsCount()
-	chi.Status.HostsCount = chi.HostsCount()
-	chi.Status.TaskID = *chi.Spec.TaskID
-	chi.Status.UpdatedHostsCount = 0
-	chi.Status.DeleteHostsCount = 0
-	chi.Status.DeletedHostsCount = 0
-	chi.Status.Pods = pods
-	chi.Status.FQDNs = fqdns
-	chi.Status.Endpoint = endpoint
-	chi.Status.Generation = chi.Generation
-	if normalized {
-		chi.Status.NormalizedCHI = &chi.Spec
-	} else {
-		chi.Status.NormalizedCHI = nil
-	}
-}
-
-// FillSelfCalculatedAddressInfo calculates and fills address info
-func (chi *ClickHouseInstallation) FillSelfCalculatedAddressInfo() {
-	// What is the max number of Pods allowed per Node
-	// TODO need to support multi-cluster
-	maxNumberOfPodsPerNode := 0
-	chi.WalkPodTemplates(func(template *ChiPodTemplate) {
-		for i := range template.PodDistribution {
-			podDistribution := &template.PodDistribution[i]
-			if podDistribution.Type == PodDistributionMaxNumberPerNode {
-				maxNumberOfPodsPerNode = podDistribution.Number
-			}
-		}
-	})
-
-	//          1perNode   2perNode  3perNode  4perNode  5perNode
-	// sh1r1    n1   a     n1  a     n1 a      n1  a     n1  a
-	// sh1r2    n2   a     n2  a     n2 a      n2  a     n2  a
-	// sh1r3    n3   a     n3  a     n3 a      n3  a     n3  a
-	// sh2r1    n4   a     n4  a     n4 a      n4  a     n1  b
-	// sh2r2    n5   a     n5  a     n5 a      n1  b     n2  b
-	// sh2r3    n6   a     n6  a     n1 b      n2  b     n3  b
-	// sh3r1    n7   a     n7  a     n2 b      n3  b     n1  c
-	// sh3r2    n8   a     n8  a     n3 b      n4  b     n2  c
-	// sh3r3    n9   a     n1  b     n4 b      n1  c     n3  c
-	// sh4r1    n10  a     n2  b     n5 b      n2  c     n1  d
-	// sh4r2    n11  a     n3  b     n1 c      n3  c     n2  d
-	// sh4r3    n12  a     n4  b     n2 c      n4  c     n3  d
-	// sh5r1    n13  a     n5  b     n3 c      n1  d     n1  e
-	// sh5r2    n14  a     n6  b     n4 c      n2  d     n2  e
-	// sh5r3    n15  a     n7  b     n5 c      n3  d     n3  e
-	// 1perNode = ceil(15 / 1 'cycles num') = 15 'cycle len'
-	// 2perNode = ceil(15 / 2 'cycles num') = 8  'cycle len'
-	// 3perNode = ceil(15 / 3 'cycles num') = 5  'cycle len'
-	// 4perNode = ceil(15 / 4 'cycles num') = 4  'cycle len'
-	// 5perNode = ceil(15 / 5 'cycles num') = 3  'cycle len'
-
-	// Number of requested cycles equals to max number of ClickHouses per node, but can't be less than 1
-	requestedClusterScopeCyclesNum := maxNumberOfPodsPerNode
-	if requestedClusterScopeCyclesNum <= 0 {
-		requestedClusterScopeCyclesNum = 1
-	}
-
-	chiScopeCycleSize := 0 // Unlimited
-	clusterScopeCycleSize := 0
-	if requestedClusterScopeCyclesNum == 1 {
-		// One cycle only requested
-		clusterScopeCycleSize = 0 // Unlimited
-	} else {
-		clusterScopeCycleSize = int(math.Ceil(float64(chi.HostsCount()) / float64(requestedClusterScopeCyclesNum)))
-	}
-
-	chi.WalkHostsFullPath(chiScopeCycleSize, clusterScopeCycleSize, func(
-		chi *ClickHouseInstallation,
-
-		chiScopeIndex int,
-		chiScopeCycleSize int,
-		chiScopeCycleIndex int,
-		chiScopeCycleOffset int,
-
-		clusterScopeIndex int,
-		clusterScopeCycleSize int,
-		clusterScopeCycleIndex int,
-		clusterScopeCycleOffset int,
-
-		clusterIndex int,
-		cluster *ChiCluster,
-
-		shardIndex int,
-		shard *ChiShard,
-
-		replicaIndex int,
-		replica *ChiReplica,
-
-		host *ChiHost,
-	) error {
-		cluster.Address.Namespace = chi.Namespace
-		cluster.Address.CHIName = chi.Name
-		cluster.Address.ClusterName = cluster.Name
-		cluster.Address.ClusterIndex = clusterIndex
-
-		shard.Address.Namespace = chi.Namespace
-		shard.Address.CHIName = chi.Name
-		shard.Address.ClusterName = cluster.Name
-		shard.Address.ClusterIndex = clusterIndex
-		shard.Address.ShardName = shard.Name
-		shard.Address.ShardIndex = shardIndex
-
-		replica.Address.Namespace = chi.Namespace
-		replica.Address.CHIName = chi.Name
-		replica.Address.ClusterName = cluster.Name
-		replica.Address.ClusterIndex = clusterIndex
-		replica.Address.ReplicaName = replica.Name
-		replica.Address.ReplicaIndex = replicaIndex
-
-		host.Address.Namespace = chi.Namespace
-		// Skip StatefulSet as impossible to self-calculate
-		// host.Address.StatefulSet = CreateStatefulSetName(host)
-		host.Address.CHIName = chi.Name
-		host.Address.ClusterName = cluster.Name
-		host.Address.ClusterIndex = clusterIndex
-		host.Address.ShardName = shard.Name
-		host.Address.ShardIndex = shardIndex
-		host.Address.ReplicaName = replica.Name
-		host.Address.ReplicaIndex = replicaIndex
-		host.Address.HostName = host.Name
-		host.Address.CHIScopeIndex = chiScopeIndex
-		host.Address.CHIScopeCycleSize = chiScopeCycleSize
-		host.Address.CHIScopeCycleIndex = chiScopeCycleIndex
-		host.Address.CHIScopeCycleOffset = chiScopeCycleOffset
-		host.Address.ClusterScopeIndex = clusterScopeIndex
-		host.Address.ClusterScopeCycleSize = clusterScopeCycleSize
-		host.Address.ClusterScopeCycleIndex = clusterScopeCycleIndex
-		host.Address.ClusterScopeCycleOffset = clusterScopeCycleOffset
-		host.Address.ShardScopeIndex = replicaIndex
-		host.Address.ReplicaScopeIndex = shardIndex
-
-		return nil
+func (cr *ClickHouseInstallation) FillStatus(endpoint string, pods, fqdns []string, ip string) {
+	cr.EnsureStatus().Fill(&FillStatusParams{
+		CHOpIP:              ip,
+		ClustersCount:       cr.ClustersCount(),
+		ShardsCount:         cr.ShardsCount(),
+		HostsCount:          cr.HostsCount(),
+		TaskID:              cr.GetSpecT().GetTaskID(),
+		HostsUpdatedCount:   0,
+		HostsAddedCount:     0,
+		HostsUnchangedCount: 0,
+		HostsCompletedCount: 0,
+		HostsDeleteCount:    0,
+		HostsDeletedCount:   0,
+		Pods:                pods,
+		FQDNs:               fqdns,
+		Endpoint:            endpoint,
+		NormalizedCR: cr.Copy(types.CopyCROptions{
+			SkipStatus:        true,
+			SkipManagedFields: true,
+		}),
 	})
 }
 
-// FillCHIPointer fills CHI pointer
-func (chi *ClickHouseInstallation) FillCHIPointer() {
-	chi.WalkHostsFullPath(0, 0, func(
-		chi *ClickHouseInstallation,
-
-		chiScopeIndex int,
-		chiScopeCycleSize int,
-		chiScopeCycleIndex int,
-		chiScopeCycleOffset int,
-
-		clusterScopeIndex int,
-		clusterScopeCycleSize int,
-		clusterScopeCycleIndex int,
-		clusterScopeCycleOffset int,
-
-		clusterIndex int,
-		cluster *ChiCluster,
-
-		shardIndex int,
-		shard *ChiShard,
-
-		replicaIndex int,
-		replica *ChiReplica,
-
-		host *ChiHost,
-	) error {
-		cluster.CHI = chi
-		shard.CHI = chi
-		replica.CHI = chi
-		host.CHI = chi
-		return nil
-	})
-}
-
-// WalkClustersFullPath walks clusters with full path
-func (chi *ClickHouseInstallation) WalkClustersFullPath(
-	f func(chi *ClickHouseInstallation, clusterIndex int, cluster *ChiCluster) error,
-) []error {
-	res := make([]error, 0)
-
-	for clusterIndex := range chi.Spec.Configuration.Clusters {
-		res = append(res, f(chi, clusterIndex, chi.Spec.Configuration.Clusters[clusterIndex]))
-	}
-
-	return res
-}
-
-// WalkClusters walks clusters
-func (chi *ClickHouseInstallation) WalkClusters(f func(cluster *ChiCluster) error) []error {
-	res := make([]error, 0)
-
-	for clusterIndex := range chi.Spec.Configuration.Clusters {
-		res = append(res, f(chi.Spec.Configuration.Clusters[clusterIndex]))
-	}
-
-	return res
-}
-
-// WalkShardsFullPath walks shards with full path
-func (chi *ClickHouseInstallation) WalkShardsFullPath(
-	f func(
-		chi *ClickHouseInstallation,
-		clusterIndex int,
-		cluster *ChiCluster,
-		shardIndex int,
-		shard *ChiShard,
-	) error,
-) []error {
-
-	res := make([]error, 0)
-
-	for clusterIndex := range chi.Spec.Configuration.Clusters {
-		cluster := chi.Spec.Configuration.Clusters[clusterIndex]
-		for shardIndex := range cluster.Layout.Shards {
-			shard := &cluster.Layout.Shards[shardIndex]
-			res = append(res, f(chi, clusterIndex, cluster, shardIndex, shard))
-		}
-	}
-
-	return res
-}
-
-// WalkShards walks shards
-func (chi *ClickHouseInstallation) WalkShards(
-	f func(
-		shard *ChiShard,
-	) error,
-) []error {
-
-	res := make([]error, 0)
-
-	for clusterIndex := range chi.Spec.Configuration.Clusters {
-		cluster := chi.Spec.Configuration.Clusters[clusterIndex]
-		for shardIndex := range cluster.Layout.Shards {
-			shard := &cluster.Layout.Shards[shardIndex]
-			res = append(res, f(shard))
-		}
-	}
-
-	return res
-}
-
-// WalkHostsFullPath walks hosts with full path
-func (chi *ClickHouseInstallation) WalkHostsFullPath(
-	chiScopeCycleSize int,
-	clusterScopeCycleSize int,
-	f func(
-		chi *ClickHouseInstallation,
-
-		chiScopeIndex int,
-		chiScopeCycleSize int,
-		chiScopeCycleIndex int,
-		chiScopeCycleOffset int,
-
-		clusterScopeIndex int,
-		clusterScopeCycleSize int,
-		clusterScopeCycleIndex int,
-		clusterScopeCycleOffset int,
-
-		clusterIndex int,
-		cluster *ChiCluster,
-
-		shardIndex int,
-		shard *ChiShard,
-
-		replicaIndex int,
-		replica *ChiReplica,
-
-		host *ChiHost,
-	) error,
-) []error {
-
-	res := make([]error, 0)
-
-	chiScopeIndex := 0
-	chiScopeCycleIndex := 0
-	chiScopeCycleOffset := 0
-
-	clusterScopeIndex := 0
-	clusterScopeCycleIndex := 0
-	clusterScopeCycleOffset := 0
-
-	for clusterIndex := range chi.Spec.Configuration.Clusters {
-		cluster := chi.Spec.Configuration.Clusters[clusterIndex]
-
-		clusterScopeIndex = 0
-		clusterScopeCycleIndex = 0
-		clusterScopeCycleOffset = 0
-
-		for shardIndex := range cluster.Layout.Shards {
-			shard := cluster.GetShard(shardIndex)
-			for replicaIndex, host := range shard.Hosts {
-				replica := cluster.GetReplica(replicaIndex)
-
-				res = append(res, f(
-					chi,
-
-					chiScopeIndex,
-					chiScopeCycleSize,
-					chiScopeCycleIndex,
-					chiScopeCycleOffset,
-
-					clusterScopeIndex,
-					clusterScopeCycleSize,
-					clusterScopeCycleIndex,
-					clusterScopeCycleOffset,
-
-					clusterIndex,
-					cluster,
-
-					shardIndex,
-					shard,
-
-					replicaIndex,
-					replica,
-
-					host,
-				))
-
-				// CHI-scope counters
-				chiScopeIndex++
-				chiScopeCycleOffset++
-				if (chiScopeCycleSize > 0) && (chiScopeCycleOffset >= chiScopeCycleSize) {
-					chiScopeCycleOffset = 0
-					chiScopeCycleIndex++
-				}
-
-				// Cluster-scope counters
-				clusterScopeIndex++
-				clusterScopeCycleOffset++
-				if (clusterScopeCycleSize > 0) && (clusterScopeCycleOffset >= clusterScopeCycleSize) {
-					clusterScopeCycleOffset = 0
-					clusterScopeCycleIndex++
-				}
-			}
-		}
-	}
-
-	return res
-}
-
-// WalkHosts walks hosts
-func (chi *ClickHouseInstallation) WalkHosts(f func(host *ChiHost) error) []error {
-	res := make([]error, 0)
-
-	for clusterIndex := range chi.Spec.Configuration.Clusters {
-		cluster := chi.Spec.Configuration.Clusters[clusterIndex]
-		for shardIndex := range cluster.Layout.Shards {
-			shard := &cluster.Layout.Shards[shardIndex]
-			for replicaIndex := range shard.Hosts {
-				host := shard.Hosts[replicaIndex]
-				res = append(res, f(host))
-			}
-		}
-	}
-
-	return res
-}
-
-// WalkHostsTillError walks hosts until an error met
-func (chi *ClickHouseInstallation) WalkHostsTillError(f func(host *ChiHost) error) error {
-	for clusterIndex := range chi.Spec.Configuration.Clusters {
-		cluster := chi.Spec.Configuration.Clusters[clusterIndex]
-		for shardIndex := range cluster.Layout.Shards {
-			shard := &cluster.Layout.Shards[shardIndex]
-			for replicaIndex := range shard.Hosts {
-				host := shard.Hosts[replicaIndex]
-				if err := f(host); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-// WalkTillError walks until an error met
-func (chi *ClickHouseInstallation) WalkTillError(
-	ctx context.Context,
-	fCHIPreliminary func(ctx context.Context, chi *ClickHouseInstallation) error,
-	fCluster func(ctx context.Context, cluster *ChiCluster) error,
-	fShard func(ctx context.Context, shard *ChiShard) error,
-	fHost func(ctx context.Context, host *ChiHost) error,
-	fCHI func(ctx context.Context, chi *ClickHouseInstallation) error,
-) error {
-
-	if err := fCHIPreliminary(ctx, chi); err != nil {
-		return err
-	}
-
-	for clusterIndex := range chi.Spec.Configuration.Clusters {
-		cluster := chi.Spec.Configuration.Clusters[clusterIndex]
-		if err := fCluster(ctx, cluster); err != nil {
-			return err
-		}
-		for shardIndex := range cluster.Layout.Shards {
-			shard := &cluster.Layout.Shards[shardIndex]
-			if err := fShard(ctx, shard); err != nil {
-				return err
-			}
-			for replicaIndex := range shard.Hosts {
-				host := shard.Hosts[replicaIndex]
-				if err := fHost(ctx, host); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	if err := fCHI(ctx, chi); err != nil {
-		return err
-	}
-
-	return nil
+func (cr *ClickHouseInstallation) Fill() {
+	FillCR(cr)
 }
 
 // MergeFrom merges from CHI
-func (chi *ClickHouseInstallation) MergeFrom(from *ClickHouseInstallation, _type MergeType) {
+func (cr *ClickHouseInstallation) MergeFrom(from *ClickHouseInstallation, _type MergeType) {
 	if from == nil {
 		return
 	}
 
-	// Copy metadata for now
-	chi.TypeMeta = from.TypeMeta
-	chi.ObjectMeta = from.ObjectMeta
-
-	// Do actual merge for Spec
-	(&chi.Spec).MergeFrom(&from.Spec, _type)
-
-	// Copy Status for now
-	chi.Status = from.Status
-}
-
-// MergeFrom merges from spec
-func (spec *ChiSpec) MergeFrom(from *ChiSpec, _type MergeType) {
-	if from == nil {
-		return
-	}
-
+	// Merge Meta
 	switch _type {
 	case MergeTypeFillEmptyValues:
-		if spec.Stop == "" {
-			spec.Stop = from.Stop
-		}
-		if spec.Restart == "" {
-			spec.Restart = from.Restart
-		}
-		if spec.Troubleshoot == "" {
-			spec.Troubleshoot = from.Troubleshoot
-		}
-		if spec.NamespaceDomainPattern == "" {
-			spec.NamespaceDomainPattern = from.NamespaceDomainPattern
-		}
+		_ = mergo.Merge(&cr.TypeMeta, from.TypeMeta)
+		_ = mergo.Merge(&cr.ObjectMeta, from.ObjectMeta)
 	case MergeTypeOverrideByNonEmptyValues:
-		if from.Stop != "" {
-			// Override by non-empty values only
-			spec.Stop = from.Stop
-		}
-		if from.Restart != "" {
-			// Override by non-empty values only
-			spec.Restart = from.Restart
-		}
-		if from.Troubleshoot != "" {
-			// Override by non-empty values only
-			spec.Troubleshoot = from.Troubleshoot
-		}
-		if from.NamespaceDomainPattern != "" {
-			spec.NamespaceDomainPattern = from.NamespaceDomainPattern
-		}
+		_ = mergo.Merge(&cr.TypeMeta, from.TypeMeta, mergo.WithOverride)
+		_ = mergo.Merge(&cr.ObjectMeta, from.ObjectMeta, mergo.WithOverride)
 	}
+	// Exclude skipped annotations
+	cr.SetAnnotations(
+		util.CopyMapFilter(
+			cr.GetAnnotations(),
+			nil,
+			util.ListSkippedAnnotations(),
+		),
+	)
 
-	spec.Templating = spec.Templating.MergeFrom(from.Templating, _type)
-	spec.Reconciling = spec.Reconciling.MergeFrom(from.Reconciling, _type)
-	spec.Defaults = spec.Defaults.MergeFrom(from.Defaults, _type)
-	spec.Configuration = spec.Configuration.MergeFrom(from.Configuration, _type)
-	spec.Templates = spec.Templates.MergeFrom(from.Templates, _type)
-	// TODO may be it would be wiser to make more intelligent merge
-	spec.UseTemplates = append(spec.UseTemplates, from.UseTemplates...)
+	// Do actual merge for Spec
+	cr.GetSpecT().MergeFrom(from.GetSpecT(), _type)
+
+	// Copy service attributes
+	cr.ensureRuntime().attributes = from.ensureRuntime().attributes
+
+	cr.EnsureStatus().CopyFrom(from.Status, types.CopyStatusOptions{
+		CopyStatusFieldGroup: types.CopyStatusFieldGroup{
+			FieldGroupInheritable: true,
+		},
+	})
 }
 
-// FindCluster finds cluster by name or index
-func (chi *ClickHouseInstallation) FindCluster(needle interface{}) *ChiCluster {
-	var resultCluster *ChiCluster
-	chi.WalkClustersFullPath(func(chi *ClickHouseInstallation, clusterIndex int, cluster *ChiCluster) error {
+// FindCluster finds cluster by name or index.
+// Expectations: name is expected to be a string, index is expected to be an int.
+func (cr *ClickHouseInstallation) FindCluster(needle interface{}) ICluster {
+	var resultCluster *Cluster
+	cr.WalkClustersFullPath(func(chi *ClickHouseInstallation, clusterIndex int, cluster *Cluster) error {
 		switch v := needle.(type) {
 		case string:
 			if cluster.Name == v {
@@ -525,17 +249,21 @@ func (chi *ClickHouseInstallation) FindCluster(needle interface{}) *ChiCluster {
 }
 
 // FindShard finds shard by name or index
-func (chi *ClickHouseInstallation) FindShard(needleCluster interface{}, needleShard interface{}) *ChiShard {
-	if cluster := chi.FindCluster(needleCluster); cluster != nil {
-		return cluster.FindShard(needleShard)
-	}
-	return nil
+// Expectations: name is expected to be a string, index is expected to be an int.
+func (cr *ClickHouseInstallation) FindShard(needleCluster interface{}, needleShard interface{}) IShard {
+	return cr.FindCluster(needleCluster).FindShard(needleShard)
+}
+
+// FindHost finds shard by name or index
+// Expectations: name is expected to be a string, index is expected to be an int.
+func (cr *ClickHouseInstallation) FindHost(needleCluster interface{}, needleShard interface{}, needleHost interface{}) *Host {
+	return cr.FindCluster(needleCluster).FindHost(needleShard, needleHost)
 }
 
 // ClustersCount counts clusters
-func (chi *ClickHouseInstallation) ClustersCount() int {
+func (cr *ClickHouseInstallation) ClustersCount() int {
 	count := 0
-	chi.WalkClusters(func(cluster *ChiCluster) error {
+	cr.WalkClusters(func(cluster ICluster) error {
 		count++
 		return nil
 	})
@@ -543,9 +271,9 @@ func (chi *ClickHouseInstallation) ClustersCount() int {
 }
 
 // ShardsCount counts shards
-func (chi *ClickHouseInstallation) ShardsCount() int {
+func (cr *ClickHouseInstallation) ShardsCount() int {
 	count := 0
-	chi.WalkShards(func(shard *ChiShard) error {
+	cr.WalkShards(func(shard *ChiShard) error {
 		count++
 		return nil
 	})
@@ -553,9 +281,9 @@ func (chi *ClickHouseInstallation) ShardsCount() int {
 }
 
 // HostsCount counts hosts
-func (chi *ClickHouseInstallation) HostsCount() int {
+func (cr *ClickHouseInstallation) HostsCount() int {
 	count := 0
-	chi.WalkHosts(func(host *ChiHost) error {
+	cr.WalkHosts(func(host *Host) error {
 		count++
 		return nil
 	})
@@ -563,10 +291,10 @@ func (chi *ClickHouseInstallation) HostsCount() int {
 }
 
 // HostsCountAttributes counts hosts by attributes
-func (chi *ClickHouseInstallation) HostsCountAttributes(a ChiHostReconcileAttributes) int {
+func (cr *ClickHouseInstallation) HostsCountAttributes(a *HostReconcileAttributes) int {
 	count := 0
-	chi.WalkHosts(func(host *ChiHost) error {
-		if host.ReconcileAttributes.Any(a) {
+	cr.WalkHosts(func(host *Host) error {
+		if host.GetReconcileAttributes().Any(a) {
 			count++
 		}
 		return nil
@@ -574,112 +302,392 @@ func (chi *ClickHouseInstallation) HostsCountAttributes(a ChiHostReconcileAttrib
 	return count
 }
 
-// GetHostTemplate gets ChiHostTemplate by name
-func (chi *ClickHouseInstallation) GetHostTemplate(name string) (*ChiHostTemplate, bool) {
-	if !chi.Spec.Templates.GetHostTemplatesIndex().Has(name) {
+// GetHostTemplate gets HostTemplate by name
+func (cr *ClickHouseInstallation) GetHostTemplate(name string) (*HostTemplate, bool) {
+	if !cr.GetSpecT().GetTemplates().GetHostTemplatesIndex().Has(name) {
 		return nil, false
 	}
-	return chi.Spec.Templates.GetHostTemplatesIndex().Get(name), true
+	return cr.GetSpecT().GetTemplates().GetHostTemplatesIndex().Get(name), true
 }
 
-// GetPodTemplate gets ChiPodTemplate by name
-func (chi *ClickHouseInstallation) GetPodTemplate(name string) (*ChiPodTemplate, bool) {
-	if !chi.Spec.Templates.GetPodTemplatesIndex().Has(name) {
+// GetPodTemplate gets PodTemplate by name
+func (cr *ClickHouseInstallation) GetPodTemplate(name string) (*PodTemplate, bool) {
+	if !cr.GetSpecT().GetTemplates().GetPodTemplatesIndex().Has(name) {
 		return nil, false
 	}
-	return chi.Spec.Templates.GetPodTemplatesIndex().Get(name), true
+	return cr.GetSpecT().GetTemplates().GetPodTemplatesIndex().Get(name), true
 }
 
 // WalkPodTemplates walks over all PodTemplates
-func (chi *ClickHouseInstallation) WalkPodTemplates(f func(template *ChiPodTemplate)) {
-	chi.Spec.Templates.GetPodTemplatesIndex().Walk(f)
+func (cr *ClickHouseInstallation) WalkPodTemplates(f func(template *PodTemplate)) {
+	cr.GetSpecT().GetTemplates().GetPodTemplatesIndex().Walk(f)
 }
 
-// GetVolumeClaimTemplate gets ChiVolumeClaimTemplate by name
-func (chi *ClickHouseInstallation) GetVolumeClaimTemplate(name string) (*ChiVolumeClaimTemplate, bool) {
-	if chi.Spec.Templates.GetVolumeClaimTemplatesIndex().Has(name) {
-		return chi.Spec.Templates.GetVolumeClaimTemplatesIndex().Get(name), true
+// GetVolumeClaimTemplate gets VolumeClaimTemplate by name
+func (cr *ClickHouseInstallation) GetVolumeClaimTemplate(name string) (*VolumeClaimTemplate, bool) {
+	if cr.GetSpecT().GetTemplates().GetVolumeClaimTemplatesIndex().Has(name) {
+		return cr.GetSpecT().GetTemplates().GetVolumeClaimTemplatesIndex().Get(name), true
 	}
 	return nil, false
 }
 
 // WalkVolumeClaimTemplates walks over all VolumeClaimTemplates
-func (chi *ClickHouseInstallation) WalkVolumeClaimTemplates(f func(template *ChiVolumeClaimTemplate)) {
-	chi.Spec.Templates.GetVolumeClaimTemplatesIndex().Walk(f)
+func (cr *ClickHouseInstallation) WalkVolumeClaimTemplates(f func(template *VolumeClaimTemplate)) {
+	if cr == nil {
+		return
+	}
+	cr.GetSpecT().GetTemplates().GetVolumeClaimTemplatesIndex().Walk(f)
 }
 
-// GetServiceTemplate gets ChiServiceTemplate by name
-func (chi *ClickHouseInstallation) GetServiceTemplate(name string) (*ChiServiceTemplate, bool) {
-	if !chi.Spec.Templates.GetServiceTemplatesIndex().Has(name) {
+// GetServiceTemplate gets ServiceTemplate by name
+func (cr *ClickHouseInstallation) GetServiceTemplate(name string) (*ServiceTemplate, bool) {
+	if !cr.GetSpecT().GetTemplates().GetServiceTemplatesIndex().Has(name) {
 		return nil, false
 	}
-	return chi.Spec.Templates.GetServiceTemplatesIndex().Get(name), true
+	return cr.GetSpecT().GetTemplates().GetServiceTemplatesIndex().Get(name), true
 }
 
-// GetCHIServiceTemplate gets ChiServiceTemplate of a CHI
-func (chi *ClickHouseInstallation) GetCHIServiceTemplate() (*ChiServiceTemplate, bool) {
-	if !chi.Spec.Defaults.Templates.HasServiceTemplate() {
+// GetRootServiceTemplate gets ServiceTemplate of a CHI
+func (cr *ClickHouseInstallation) GetRootServiceTemplate() (*ServiceTemplate, bool) {
+	if !cr.GetSpec().GetDefaults().Templates.HasServiceTemplate() {
 		return nil, false
 	}
-	name := chi.Spec.Defaults.Templates.GetServiceTemplate()
-	return chi.GetServiceTemplate(name)
+	name := cr.GetSpec().GetDefaults().Templates.GetServiceTemplate()
+	return cr.GetServiceTemplate(name)
+}
+
+// MatchNamespace matches namespace
+func (cr *ClickHouseInstallation) MatchNamespace(namespace string) bool {
+	if cr == nil {
+		return false
+	}
+	return cr.Namespace == namespace
 }
 
 // MatchFullName matches full name
-func (chi *ClickHouseInstallation) MatchFullName(namespace, name string) bool {
-	if chi == nil {
+func (cr *ClickHouseInstallation) MatchFullName(namespace, name string) bool {
+	if cr == nil {
 		return false
 	}
-	return (chi.Namespace == namespace) && (chi.Name == name)
+	return (cr.Namespace == namespace) && (cr.Name == name)
+}
+
+// FoundIn checks whether CHI can be found in haystack
+func (cr *ClickHouseInstallation) FoundIn(haystack []*ClickHouseInstallation) bool {
+	if cr == nil {
+		return false
+	}
+
+	for _, candidate := range haystack {
+		if candidate.MatchFullName(cr.Namespace, cr.Name) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Possible templating policies
 const (
-	TemplatingPolicyManual = "manual"
 	TemplatingPolicyAuto   = "auto"
+	TemplatingPolicyManual = "manual"
 )
 
 // IsAuto checks whether templating policy is auto
-func (chi *ClickHouseInstallation) IsAuto() bool {
-	if chi == nil {
+func (cr *ClickHouseInstallation) IsAuto() bool {
+	if cr == nil {
 		return false
 	}
-	if (chi.Namespace == "") && (chi.Name == "") {
+	if (cr.Namespace == "") && (cr.Name == "") {
 		return false
 	}
-	return strings.ToLower(chi.Spec.Templating.GetPolicy()) == TemplatingPolicyAuto
+	return cr.GetSpecT().GetTemplating().GetPolicy() == TemplatingPolicyAuto
 }
 
 // IsStopped checks whether CHI is stopped
-func (chi *ClickHouseInstallation) IsStopped() bool {
-	return util.IsStringBoolTrue(chi.Spec.Stop)
+func (cr *ClickHouseInstallation) IsStopped() bool {
+	if cr == nil {
+		return false
+	}
+	return cr.GetSpecT().GetStop().Value()
 }
 
-// Restart const presents possible values for .spec.restart
+// Restart constants present available values for .spec.restart
+// Controlling the operator's Clickhouse instances restart policy
 const (
-	RestartAll           = "Restart"
+	// RestartRollingUpdate requires to roll over all hosts in the cluster and shutdown and reconcile each of it.
+	// This restart policy means that all hosts in the cluster would pass through shutdown/reconcile cycle.
 	RestartRollingUpdate = "RollingUpdate"
 )
 
 // IsRollingUpdate checks whether CHI should perform rolling update
-func (chi *ClickHouseInstallation) IsRollingUpdate() bool {
-	return chi.Spec.Restart == RestartRollingUpdate
-}
-
-// IsNoRestart checks whether CHI has no restart request
-func (chi *ClickHouseInstallation) IsNoRestart() bool {
-	return chi.Spec.Restart == ""
+func (cr *ClickHouseInstallation) IsRollingUpdate() bool {
+	if cr == nil {
+		return false
+	}
+	return cr.GetSpecT().GetRestart().Value() == RestartRollingUpdate
 }
 
 // IsTroubleshoot checks whether CHI is in troubleshoot mode
-func (chi *ClickHouseInstallation) IsTroubleshoot() bool {
-	return util.IsStringBoolTrue(chi.Spec.Troubleshoot)
+func (cr *ClickHouseInstallation) IsTroubleshoot() bool {
+	if cr == nil {
+		return false
+	}
+	return cr.GetSpecT().GetTroubleshoot().Value()
 }
 
 // GetReconciling gets reconciling spec
-func (chi *ClickHouseInstallation) GetReconciling() *ChiReconciling {
-	if chi == nil {
+func (cr *ClickHouseInstallation) GetReconciling() *Reconciling {
+	if cr == nil {
 		return nil
 	}
-	return chi.Spec.Reconciling
+	return cr.GetSpecT().Reconciling
+}
+
+// Copy makes copy of a CHI, filtering fields according to specified CopyOptions
+func (cr *ClickHouseInstallation) Copy(opts types.CopyCROptions) *ClickHouseInstallation {
+	if cr == nil {
+		return nil
+	}
+	jsonBytes, err := json.Marshal(cr)
+	if err != nil {
+		return nil
+	}
+
+	var chi2 *ClickHouseInstallation
+	if err := json.Unmarshal(jsonBytes, &chi2); err != nil {
+		return nil
+	}
+
+	if opts.SkipStatus {
+		chi2.Status = nil
+	}
+
+	if opts.SkipManagedFields {
+		chi2.SetManagedFields(nil)
+	}
+
+	return chi2
+}
+
+// JSON returns JSON string
+func (cr *ClickHouseInstallation) JSON(opts types.CopyCROptions) string {
+	if cr == nil {
+		return ""
+	}
+
+	filtered := cr.Copy(opts)
+	jsonBytes, err := json.MarshalIndent(filtered, "", "  ")
+	if err != nil {
+		return fmt.Sprintf("unable to parse. err: %v", err)
+	}
+	return string(jsonBytes)
+
+}
+
+// YAML return YAML string
+func (cr *ClickHouseInstallation) YAML(opts types.CopyCROptions) string {
+	if cr == nil {
+		return ""
+	}
+
+	filtered := cr.Copy(opts)
+	yamlBytes, err := yaml.Marshal(filtered)
+	if err != nil {
+		return fmt.Sprintf("unable to parse. err: %v", err)
+	}
+	return string(yamlBytes)
+}
+
+// FirstHost returns first host of the CHI
+func (cr *ClickHouseInstallation) FirstHost() *Host {
+	var result *Host
+	cr.WalkHosts(func(host *Host) error {
+		if result == nil {
+			result = host
+		}
+		return nil
+	})
+	return result
+}
+
+func (cr *ClickHouseInstallation) GetName() string {
+	if cr == nil {
+		return ""
+	}
+	return cr.Name
+}
+
+func (cr *ClickHouseInstallation) GetNamespace() string {
+	if cr == nil {
+		return ""
+	}
+	return cr.Namespace
+}
+
+func (cr *ClickHouseInstallation) GetLabels() map[string]string {
+	if cr == nil {
+		return nil
+	}
+	return cr.Labels
+}
+
+func (cr *ClickHouseInstallation) GetAnnotations() map[string]string {
+	if cr == nil {
+		return nil
+	}
+	return cr.Annotations
+}
+
+// WalkClustersFullPath walks clusters with full path
+func (cr *ClickHouseInstallation) WalkClustersFullPath(
+	f func(chi *ClickHouseInstallation, clusterIndex int, cluster *Cluster) error,
+) []error {
+	if cr == nil {
+		return nil
+	}
+	res := make([]error, 0)
+
+	for clusterIndex := range cr.GetSpecT().Configuration.Clusters {
+		res = append(res, f(cr, clusterIndex, cr.GetSpecT().Configuration.Clusters[clusterIndex]))
+	}
+
+	return res
+}
+
+// WalkClusters walks clusters
+func (cr *ClickHouseInstallation) WalkClusters(f func(i ICluster) error) []error {
+	if cr == nil {
+		return nil
+	}
+	res := make([]error, 0)
+
+	for clusterIndex := range cr.GetSpecT().Configuration.Clusters {
+		res = append(res, f(cr.GetSpecT().Configuration.Clusters[clusterIndex]))
+	}
+
+	return res
+}
+
+// WalkShards walks shards
+func (cr *ClickHouseInstallation) WalkShards(
+	f func(
+		shard *ChiShard,
+	) error,
+) []error {
+	if cr == nil {
+		return nil
+	}
+	res := make([]error, 0)
+
+	for clusterIndex := range cr.GetSpecT().Configuration.Clusters {
+		cluster := cr.GetSpecT().Configuration.Clusters[clusterIndex]
+		for shardIndex := range cluster.Layout.Shards {
+			shard := cluster.Layout.Shards[shardIndex]
+			res = append(res, f(shard))
+		}
+	}
+
+	return res
+}
+
+// WalkHostsFullPathAndScope walks hosts with full path
+func (cr *ClickHouseInstallation) WalkHostsFullPathAndScope(
+	crScopeCycleSize int,
+	clusterScopeCycleSize int,
+	f WalkHostsAddressFn,
+) (res []error) {
+	if cr == nil {
+		return nil
+	}
+	address := types.NewHostScopeAddress(crScopeCycleSize, clusterScopeCycleSize)
+	for clusterIndex := range cr.GetSpecT().Configuration.Clusters {
+		cluster := cr.GetSpecT().Configuration.Clusters[clusterIndex]
+		address.ClusterScopeAddress.Init()
+		for shardIndex := range cluster.Layout.Shards {
+			shard := cluster.GetShard(shardIndex)
+			for replicaIndex, host := range shard.Hosts {
+				replica := cluster.GetReplica(replicaIndex)
+				address.ClusterIndex = clusterIndex
+				address.ShardIndex = shardIndex
+				address.ReplicaIndex = replicaIndex
+				res = append(res, f(cr, cluster, shard, replica, host, address))
+				address.CRScopeAddress.Inc()
+				address.ClusterScopeAddress.Inc()
+			}
+		}
+	}
+	return res
+}
+
+// WalkHostsFullPath walks hosts with a function
+func (cr *ClickHouseInstallation) WalkHostsFullPath(f WalkHostsAddressFn) []error {
+	return cr.WalkHostsFullPathAndScope(0, 0, f)
+}
+
+// WalkHosts walks hosts with a function
+func (cr *ClickHouseInstallation) WalkHosts(f func(host *Host) error) []error {
+	if cr == nil {
+		return nil
+	}
+	res := make([]error, 0)
+
+	for clusterIndex := range cr.GetSpecT().Configuration.Clusters {
+		cluster := cr.GetSpecT().Configuration.Clusters[clusterIndex]
+		for shardIndex := range cluster.Layout.Shards {
+			shard := cluster.Layout.Shards[shardIndex]
+			for replicaIndex := range shard.Hosts {
+				host := shard.Hosts[replicaIndex]
+				res = append(res, f(host))
+			}
+		}
+	}
+
+	return res
+}
+
+// WalkTillError walks hosts with a function until an error met
+func (cr *ClickHouseInstallation) WalkTillError(
+	ctx context.Context,
+	fCRPreliminary func(ctx context.Context, chi *ClickHouseInstallation) error,
+	fCluster func(ctx context.Context, cluster *Cluster) error,
+	fShards func(ctx context.Context, shards []*ChiShard) error,
+	fCRFinal func(ctx context.Context, chi *ClickHouseInstallation) error,
+) error {
+	if err := fCRPreliminary(ctx, cr); err != nil {
+		return err
+	}
+
+	for clusterIndex := range cr.GetSpecT().Configuration.Clusters {
+		cluster := cr.GetSpecT().Configuration.Clusters[clusterIndex]
+		if err := fCluster(ctx, cluster); err != nil {
+			return err
+		}
+
+		shards := make([]*ChiShard, 0, len(cluster.Layout.Shards))
+		for shardIndex := range cluster.Layout.Shards {
+			shards = append(shards, cluster.Layout.Shards[shardIndex])
+		}
+		if err := fShards(ctx, shards); err != nil {
+			return err
+		}
+	}
+
+	if err := fCRFinal(ctx, cr); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (cr *ClickHouseInstallation) IsZero() bool {
+	return cr == nil
+}
+
+func (cr *ClickHouseInstallation) IsNonZero() bool {
+	return cr != nil
+}
+
+func (cr *ClickHouseInstallation) NamespaceName() (string, string) {
+	return util.NamespaceName(cr)
 }

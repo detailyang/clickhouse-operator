@@ -1,4 +1,14 @@
-vendor/
 docs/
+hack/
+tests/
+.devspace/
 .vagrant/
+.idea/
+
+devspace.yaml
+Vagrantfile
+
+config/config-dev.yaml
+config/secret.yaml
+
 *.log

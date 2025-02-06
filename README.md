@@ -1,43 +1,53 @@
-# ClickHouse Operator
+# Altinity Kubernetes Operator for ClickHouse®
 
-ClickHouse Operator creates, configures and manages ClickHouse clusters running on Kubernetes.
+Altinity Kubernetes Operator for ClickHouse creates, configures and manages ClickHouse clusters running on Kubernetes.
 
+[![Build Master](https://github.com/Altinity/clickhouse-operator/actions/workflows/build_master.yaml/badge.svg)](https://github.com/Altinity/clickhouse-operator/actions/workflows/build_master.yaml)
 [![GitHub release](https://img.shields.io/github/v/release/altinity/clickhouse-operator?include_prereleases)](https://img.shields.io/github/v/release/altinity/clickhouse-operator?include_prereleases)
-[![CircleCI](https://circleci.com/gh/Altinity/clickhouse-operator.svg?style=svg)](https://circleci.com/gh/Altinity/clickhouse-operator)
-[![Docker Pulls](https://img.shields.io/docker/pulls/altinity/clickhouse-operator.svg)](https://hub.docker.com/r/altinity/clickhouse-operator)
-[![Go Report Card](https://goreportcard.com/badge/github.com/altinity/clickhouse-operator)](https://goreportcard.com/report/github.com/altinity/clickhouse-operator)
-[![Go version](https://img.shields.io/github/go-mod/go-version/altinity/clickhouse-operator)](https://img.shields.io/github/go-mod/go-version/altinity/clickhouse-operator)
-[![issues](https://img.shields.io/github/issues/altinity/clickhouse-operator.svg)](https://github.com/altinity/clickhouse-operator/issues)
 [![tags](https://img.shields.io/github/tag/altinity/clickhouse-operator.svg)](https://github.com/altinity/clickhouse-operator/tags)
+[![Docker Pulls](https://img.shields.io/docker/pulls/altinity/clickhouse-operator.svg)](https://hub.docker.com/r/altinity/clickhouse-operator)
+[![Go version](https://img.shields.io/github/go-mod/go-version/altinity/clickhouse-operator)](https://img.shields.io/github/go-mod/go-version/altinity/clickhouse-operator)
+[![Go Report Card](https://goreportcard.com/badge/github.com/altinity/clickhouse-operator)](https://goreportcard.com/report/github.com/altinity/clickhouse-operator)
+[![issues](https://img.shields.io/github/issues/altinity/clickhouse-operator.svg)](https://github.com/altinity/clickhouse-operator/issues)
+<a href="https://altinity.com/slack">
+  <img src="https://img.shields.io/static/v1?logo=slack&logoColor=959DA5&label=Slack&labelColor=333a41&message=join%20conversation&color=3AC358" alt="AltinityDB Slack" />
+</a>
 
 ## Features
 
-The ClickHouse Operator for Kubernetes currently provides the following:
-
-- Creates ClickHouse clusters based on Custom Resource [specification][chi_max_yaml] provided
+- Creates ClickHouse clusters defined as custom resources
 - Customized storage provisioning (VolumeClaim templates)
 - Customized pod templates
 - Customized service templates for endpoints
-- ClickHouse configuration and settings (including Zookeeper integration)
-- Flexible templating
+- ClickHouse configuration management
+- ClickHouse users management
 - ClickHouse cluster scaling including automatic schema propagation
 - ClickHouse version upgrades
 - Exporting ClickHouse metrics to Prometheus
 
+## Community
+
+The Altinity Kubernetes Operator for ClickHouse is a community effort sponsored by Altinity. The best way to reach us or ask questions is:
+
+* Join the [Altinity Slack](https://altinity.com/slack) - Chat with the developers and other users
+* Log an [issue on GitHub](https://github.com/Altinity/clickhouse-operator/issues) - Ask questions, log bugs and feature requests
+
 ## Requirements
 
- * Kubernetes 1.15.11+
+ * Kubernetes 1.19+
+ * ClickHouse 21.11+. For older ClickHouse versions use operator 0.23.7 or earlier.
  
 ## Documentation
 
 [Quick Start Guide][quick_start_guide]
 
-**Advanced setups**
+**Advanced configuration**
  * [Detailed Operator Installation Instructions][detailed_installation_instructions]
    * [Operator Configuration][operator_configuration]
  * [Setup ClickHouse cluster with replication][replication_setup]
    * [Setting up Zookeeper][zookeeper_setup]
  * [Persistent Storage Configuration][storage_configuration]
+ * [Security Hardening][security_hardening]
  * [ClickHouse Installation Custom Resource specification][crd_explained]
  
 **Maintenance tasks**
@@ -53,19 +63,32 @@ The ClickHouse Operator for Kubernetes currently provides the following:
 
 **How to contribute**
  * [How to contribute/submit a patch][contributing_manual]
+ * [How to easy development process with devspace.sh][devspace_manual]
  
 ---
-**All docs**
- * [All available docs list][all_docs_list]
+ * [Documentation index][all_docs_list]
 ---
  
 ## License
 
-Copyright (c) 2019-2219, Altinity Ltd and/or its affiliates. All rights reserved.
+Copyright (c) 2019-2023, Altinity Inc and/or its affiliates. All rights reserved.
 
-`clickhouse-operator` is licensed under the Apache License 2.0.
+Altinity Kubernetes Operator for ClickHouse is licensed under the Apache License 2.0.
 
 See [LICENSE](./LICENSE) for more details.
+
+## Commercial Support
+
+Altinity is the primary maintainer of the operator. It is the basis of Altinity.Cloud and
+is also used in self-managed installations. Altinity offers a range of 
+services related to ClickHouse and analytic applications on Kubernetes. 
+
+- [Official website](https://altinity.com/) - Get a high level overview of Altinity and our offerings.
+- [Altinity.Cloud](https://altinity.com/cloud-database/) - Run ClickHouse in our cloud or yours.
+- [Altinity Support](https://altinity.com/support/) - Get Enterprise-class support for ClickHouse.
+- [Slack](https://altinity.com/slack) - Talk directly with ClickHouse users and Altinity devs.
+- [Contact us](https://hubs.la/Q020sH3Z0) - Contact Altinity with your questions or issues.
+- [Free consultation](https://hubs.la/Q020sHkv0) - Get a free consultation with a ClickHouse expert today.
  
 [chi_max_yaml]: ./docs/chi-examples/99-clickhouseinstallation-max.yaml
 [intro]: ./docs/introduction.md
@@ -83,5 +106,7 @@ See [LICENSE](./LICENSE) for more details.
 [update_operator]: ./docs/operator_upgrade.md
 [schema_migration]: ./docs/schema_migration.md
 [operator_configuration]: ./docs/operator_configuration.md
-[all_docs_list]: ./docs/README.md
 [contributing_manual]: ./CONTRIBUTING.md
+[devspace_manual]: ./docs/devspace.md
+[all_docs_list]: ./docs/README.md
+[security_hardening]: ./docs/security_hardening.md

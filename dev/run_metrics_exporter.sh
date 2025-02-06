@@ -10,7 +10,7 @@ source "${CUR_DIR}/go_build_config.sh"
 # Setup paths
 LOG_DIR="${CUR_DIR}/log"
 
-echo -n "Building ${METRICS_EXPORTER_BIN}, please wait..."
+echo "Building ${METRICS_EXPORTER_BIN}, please wait..."
 if [[ $1 == "nobuild" ]]; then
     echo "Build step skipped, starting old binary"
 else
@@ -27,14 +27,14 @@ if [[ ! -x "${METRICS_EXPORTER_BIN}" ]]; then
     exit 2
 fi
 
-    echo "Starting ${METRICS_EXPORTER_BIN}..."
+echo "Starting ${METRICS_EXPORTER_BIN}..."
 
-    mkdir -p "${LOG_DIR}"
-    rm -f "${LOG_DIR}"/clickhouse-operator.*.log.*
-    "${METRICS_EXPORTER_BIN}" \
-    	-alsologtostderr=true \
-    	-log_dir=log \
-    	-v=1
+mkdir -p "${LOG_DIR}"
+rm -f "${LOG_DIR}"/clickhouse-operator.*.log.*
+"${METRICS_EXPORTER_BIN}" \
+    -alsologtostderr=true \
+    -log_dir=log \
+    -v=1
 #	-logtostderr=true \
 #	-stderrthreshold=FATAL \
 

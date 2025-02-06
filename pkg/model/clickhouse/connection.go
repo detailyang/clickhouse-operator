@@ -16,35 +16,45 @@ package clickhouse
 
 import (
 	"context"
-	databasesql "database/sql"
+	"crypto/tls"
+	"crypto/x509"
+	"database/sql"
 	"fmt"
-	"time"
+
+	// go-clickhouse is explicitly required in order to setup connection to clickhouse db
+	//goch "github.com/mailru/go-clickhouse"
+	goch "github.com/mailru/go-clickhouse/v2"
 
 	log "github.com/altinity/clickhouse-operator/pkg/announcer"
 	"github.com/altinity/clickhouse-operator/pkg/util"
-
-	// go-clickhouse is explicitly required in order to setup connection to clickhouse db
-	_ "github.com/mailru/go-clickhouse"
 )
+
+// const clickHouseDriverName = "clickhouse"
+const clickHouseDriverName = "chhttp"
+
+func init() {
+	goch.RegisterTLSConfig(tlsSettings, &tls.Config{InsecureSkipVerify: true})
+}
 
 // Connection specifies clickhouse database connection object
 type Connection struct {
-	params *ConnectionParams
-	conn   *databasesql.DB
+	params *EndpointConnectionParams
+	db     *sql.DB
 	l      log.Announcer
 }
 
 // NewConnection creates new clickhouse connection
-func NewConnection(params *ConnectionParams) *Connection {
+func NewConnection(params *EndpointConnectionParams) *Connection {
 	// Do not establish connection immediately, do it in l lazy manner
 	return &Connection{
 		params: params,
 		l:      log.New(),
 	}
+
 }
 
 // Params gets connection params
-func (c *Connection) Params() *ConnectionParams {
+func (c *Connection) Params() *EndpointConnectionParams {
 	if c == nil {
 		return nil
 	}
@@ -62,42 +72,51 @@ func (c *Connection) SetLog(l log.Announcer) *Connection {
 
 // connect performs connect
 func (c *Connection) connect(ctx context.Context) {
+	// Add root CA
+	if c.params.rootCA != "" {
+		rootCAs := x509.NewCertPool()
+		if cert, err := x509.ParseCertificate([]byte(c.params.rootCA)); err != nil {
+			c.l.V(1).F().Error("unable to parse CERT specified in rootCA: %v", err)
+		} else {
+			rootCAs.AddCert(cert)
+			if err := goch.RegisterTLSConfig(tlsSettings, &tls.Config{
+				RootCAs: rootCAs,
+			}); err != nil {
+				c.l.V(1).F().Error("unable to register TLS config %v", err)
+			}
+		}
+	}
+
 	c.l.V(2).Info("Establishing connection: %s", c.params.GetDSNWithHiddenCredentials())
-	dbConnection, err := databasesql.Open("clickhouse", c.params.GetDSN())
+	dbConnection, err := sql.Open(clickHouseDriverName, c.params.GetDSN())
 	if err != nil {
-		c.l.V(1).A().Error("FAILED Open(%s). Err: %v", c.params.GetDSNWithHiddenCredentials(), err)
+		c.l.V(1).F().Error("FAILED Open(%s). Err: %v", c.params.GetDSNWithHiddenCredentials(), err)
 		return
 	}
 
-	// Ping should be deadlined
-	var parentCtx context.Context
-	if ctx == nil {
-		parentCtx = context.Background()
-	} else {
-		parentCtx = ctx
-	}
-	pingCtx, cancel := context.WithDeadline(parentCtx, time.Now().Add(c.params.GetConnectTimeout()))
+	// Ping should have timeout
+	pingCtx, cancel := context.WithTimeout(c.ensureCtx(ctx), c.params.GetConnectTimeout())
 	defer cancel()
 
 	if err := dbConnection.PingContext(pingCtx); err != nil {
-		c.l.V(1).A().Error("FAILED Ping(%s). Err: %v", c.params.GetDSNWithHiddenCredentials(), err)
+		c.l.V(1).F().Error("FAILED Ping(%s). Err: %v", c.params.GetDSNWithHiddenCredentials(), err)
 		_ = dbConnection.Close()
 		return
 	}
 
-	c.conn = dbConnection
+	c.db = dbConnection
 }
 
 // ensureConnected ensures connection is set
 func (c *Connection) ensureConnected(ctx context.Context) bool {
-	if c.conn != nil {
+	if c.db != nil {
 		c.l.V(2).F().Info("Already connected: %s", c.params.GetDSNWithHiddenCredentials())
 		return true
 	}
 
 	c.connect(ctx)
 
-	return c.conn != nil
+	return c.db != nil
 }
 
 // QueryContext runs given sql query on behalf of specified context
@@ -106,26 +125,24 @@ func (c *Connection) QueryContext(ctx context.Context, sql string) (*QueryResult
 		return nil, nil
 	}
 
-	var parentCtx context.Context
-	if ctx == nil {
-		parentCtx = context.Background()
-	} else {
-		parentCtx = ctx
-	}
-	queryCtx, cancel := context.WithDeadline(parentCtx, time.Now().Add(c.params.GetQueryTimeout()))
-
-	if !c.ensureConnected(queryCtx) {
-		cancel()
+	if !c.ensureConnected(ctx) {
 		s := fmt.Sprintf("FAILED connect(%s) for SQL: %s", c.params.GetDSNWithHiddenCredentials(), sql)
-		c.l.V(1).A().Error(s)
+		c.l.V(1).F().Error(s)
 		return nil, fmt.Errorf(s)
 	}
 
-	rows, err := c.conn.QueryContext(queryCtx, sql)
+	if util.IsContextDone(ctx) {
+		return nil, ctx.Err()
+	}
+
+	// Query should have timeout
+	queryCtx, cancel := context.WithTimeout(c.ensureCtx(ctx), c.params.GetQueryTimeout())
+
+	rows, err := c.db.QueryContext(queryCtx, sql)
 	if err != nil {
 		cancel()
 		s := fmt.Sprintf("FAILED Query(%s) %v for SQL: %s", c.params.GetDSNWithHiddenCredentials(), err, sql)
-		c.l.V(1).A().Error(s)
+		c.l.V(1).F().Error(s)
 		return nil, err
 	}
 
@@ -139,19 +156,18 @@ func (c *Connection) Query(sql string) (*QueryResult, error) {
 	return c.QueryContext(nil, sql)
 }
 
+func (c *Connection) ensureCtx(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return ctx
+}
+
 // ctx creates context with deadline
 func (c *Connection) ctx(ctx context.Context, opts *QueryOptions) (context.Context, context.CancelFunc) {
-	var parentCtx context.Context
-	if ctx == nil {
-		parentCtx = context.Background()
-	} else {
-		parentCtx = ctx
-	}
-	return context.WithDeadline(
-		parentCtx,
-		time.Now().Add(
-			util.ReasonableDuration(opts.GetQueryTimeout(), c.params.GetQueryTimeout()),
-		),
+	return context.WithTimeout(
+		c.ensureCtx(ctx),
+		util.ReasonableDuration(opts.GetQueryTimeout(), c.params.GetQueryTimeout()),
 	)
 }
 
@@ -167,15 +183,15 @@ func (c *Connection) Exec(_ctx context.Context, sql string, opts *QueryOptions) 
 	if !c.ensureConnected(ctx) {
 		cancel()
 		s := fmt.Sprintf("FAILED connect(%s) for SQL: %s", c.params.GetDSNWithHiddenCredentials(), sql)
-		c.l.V(1).A().Error(s)
+		c.l.V(1).F().Error(s)
 		return fmt.Errorf(s)
 	}
 
-	_, err := c.conn.ExecContext(ctx, sql)
+	_, err := c.db.ExecContext(ctx, sql)
 
 	if err != nil {
 		cancel()
-		c.l.V(1).A().Error("FAILED Exec(%s) %v for SQL: %s", c.params.GetDSNWithHiddenCredentials(), err, sql)
+		c.l.V(1).F().Error("FAILED Exec(%s) %v for SQL: %s", c.params.GetDSNWithHiddenCredentials(), err, sql)
 		return err
 	}
 

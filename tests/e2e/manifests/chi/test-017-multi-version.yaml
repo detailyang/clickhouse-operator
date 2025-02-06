@@ -1,0 +1,39 @@
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: test-017-multi-version
+  labels:
+    clickhouse.altinity.com/chi: test-017-multi-version
+  annotations:
+    clickhouse.altinity.com/email: "myname@mydomain.com, yourname@yourdoman.com"
+spec:
+  templates:
+    podTemplates:
+    - name: v23.3
+      spec:
+        containers:
+        - name: clickhouse-pod
+          image: clickhouse/clickhouse-server:23.3
+    - name: v23.8
+      spec:
+        containers:
+        - name: clickhouse-pod
+          image: clickhouse/clickhouse-server:23.8
+  configuration:
+    clusters:
+    - name: default
+      layout:
+        shards:
+         - templates:
+             podTemplate: v23.3
+         - templates:
+             podTemplate: v23.8
+    files:
+      users.d/remove_database_ordinary.xml: |
+        <yandex>
+          <profiles>
+             <default>
+                <default_database_engine remove="1"/>
+             </default>
+          </profiles>
+        </yandex>

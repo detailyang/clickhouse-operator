@@ -11,21 +11,23 @@
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
-# IDE folders
+# IDE folders - everywhere
 .idea
-/.project
-/.pydevproject
+.project
+.pydevproject
 
-# Skip log folder
+# Skip logs and caches
 log
 *.log
+*.log.txt
+tests/report_*.html
 __pycache__
 
 # Skip dev runtime-produced
 dev/bin
 dev/log
 
-.vagrant
+/.vagrant
 /.DS_Store
 
 # Skip vendor
@@ -38,3 +40,12 @@ dockerfile/actions
 
 # python virtualenv
 venv
+
+# Tests cached files
+tests/image/cache
+
+# Skip tmp folder
+/tmp/
+
+# Ignore DevSpace cache and log folder
+/.devspace

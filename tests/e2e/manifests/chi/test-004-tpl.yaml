@@ -1,0 +1,22 @@
+apiVersion: "clickhouse.altinity.com/v1"
+kind: "ClickHouseInstallation"
+metadata:
+  name: test-004-tpl
+spec:
+  useTemplates:
+    - name: clickhouse-version
+  configuration:
+    clusters:
+      - name: single
+  defaults:
+    templates:
+      dataVolumeClaimTemplate: default
+  templates:
+    volumeClaimTemplates:
+      - name: default
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 100Mi

@@ -11,9 +11,11 @@ set -o pipefail
 CUR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 source "${CUR_DIR}/go_build_config.sh"
 
-CODE_GENERATOR_DIR_INSIDE_MODULES="${SRC_ROOT}/${MODULES_DIR}/k8s.io/code-generator"
+# Possible options for code generator location
+CODE_GENERATOR_DIR_INSIDE_MODULES="${SRC_ROOT}/vendor/k8s.io/code-generator"
 CODE_GENERATOR_DIR_INSIDE_GOPATH="${GOPATH}/src/k8s.io/code-generator"
 
+# Detect code generator location
 CODE_GENERATOR_DIR=$( \
     realpath "${CODE_GENERATOR_DIR:-$( \
         cd "${SRC_ROOT}"; \
@@ -33,9 +35,31 @@ else
     echo "CUSTOM dir ${CODE_GENERATOR_DIR} is used to run code generator from"
 fi
 
+echo "Prepare local tmp folder for generator"
+mkdir -p "${GENERATOR_ROOT}"
+
+echo ""
+echo "Generate code for clickhouse.altinity.com:v1 into ${GENERATOR_ROOT}"
 bash "${CODE_GENERATOR_DIR}/generate-groups.sh" \
-    all \
-    github.com/altinity/clickhouse-operator/pkg/client \
-    github.com/altinity/clickhouse-operator/pkg/apis \
+    client,deepcopy,informer,lister \
+    "${REPO}/pkg/client" \
+    "${REPO}/pkg/apis" \
     "clickhouse.altinity.com:v1" \
-    -o "${SRC_ROOT}/generator"
+    -o "${GENERATOR_ROOT}" \
+    --go-header-file "${SRC_ROOT}/hack/boilerplate.go.txt"
+
+echo ""
+echo "Generate code for clickhouse-keeper.altinity.com:v1 into ${GENERATOR_ROOT}"
+bash "${CODE_GENERATOR_DIR}/generate-groups.sh" \
+    deepcopy \
+    "${REPO}/pkg/client" \
+    "${REPO}/pkg/apis" \
+    "clickhouse-keeper.altinity.com:v1" \
+    -o "${GENERATOR_ROOT}" \
+    --go-header-file "${SRC_ROOT}/hack/boilerplate.go.txt"
+
+echo "Copy generated sources into: ${PKG_ROOT}"
+cp -r "${GENERATOR_ROOT}/${REPO}/pkg/"* "${PKG_ROOT}"
+
+echo "Cleanup local tmp folder"
+rm -rf "${GENERATOR_ROOT}"
